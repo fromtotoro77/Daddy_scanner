@@ -665,20 +665,27 @@ async function startCamera(isRetry = false) {
     video.srcObject = stream;
     await video.play().catch(() => {});
 
-    // 권한 최초 허용 직후엔 저해상도 기본 스트림이 오는 기기가 있음(첫 실행 프리뷰 짤림).
-    // 해상도를 확인해 낮으면 재협상하고, 그래도 낮으면 스트림을 1회 재시작한다.
+    // 첫 실행 프리뷰 짤림 대응: 권한 최초 허용/배포 직후엔
+    // ① 저해상도 기본 스트림 또는 ② 화면과 어긋난 가로형 프레임이 오는 기기가 있다.
+    // 문제가 있으면 재협상하고, 그래도 안 되면 스트림을 1회 재시작한다.
     const track = stream.getVideoTracks()[0];
     if (track) {
       await new Promise((r) => setTimeout(r, 250)); // 설정 안정화 대기
-      let st = track.getSettings();
-      if ((st.width || 0) * (st.height || 0) < 1200 * 900) {
+      const bad = () => {
+        const st = track.getSettings();
+        const lowRes = (st.width || 0) * (st.height || 0) < 1200 * 900;
+        const winLandscape = window.innerWidth > window.innerHeight;
+        const vidLandscape = (st.width || 0) > (st.height || 0);
+        return lowRes || vidLandscape !== winLandscape; // 방향 불일치 = 첫 실행 짤림의 실제 원인
+      };
+      if (bad()) {
         try {
           await track.applyConstraints({ width: { ideal: 2560 }, height: { ideal: 2560 } });
-          await new Promise((r) => setTimeout(r, 250));
-          st = track.getSettings();
+          await new Promise((r) => setTimeout(r, 300));
         } catch (e) { /* 재협상 미지원 기기 */ }
-        if ((st.width || 0) * (st.height || 0) < 1200 * 900 && !isRetry) {
+        if (bad() && !isRetry) {
           stopCamera();
+          await new Promise((r) => setTimeout(r, 150));
           return startCamera(true);
         }
       }
@@ -1012,7 +1019,14 @@ async function addSpreadPages(blob, silent) {
     if (canvas.width < canvas.height * 1.15) {
       const single = await new Promise((res) => canvas.toBlob(res, 'image/jpeg', 0.92));
       await addPage(single, true, true);
-      if (!silent) toast('펼침면으로 보이지 않아 한 페이지로 저장됨', { duration: 1800 });
+      if (!silent) {
+        // 세로형인데 가로 골짜기가 있으면 = 화면이 안 돌아간 채 가로로 찍은 펼침면
+        if (hasHorizontalValley(canvas)) {
+          toast('화면이 회전되지 않아 좌/우 분할을 못 했어요 — 폰의 화면 자동회전을 켜고 다시 촬영해 주세요', { type: 'error', duration: 4000 });
+        } else {
+          toast('펼침면으로 보이지 않아 한 페이지로 저장됨', { duration: 1800 });
+        }
+      }
       return true;
     }
     const sx = findSpineX(canvas);
@@ -1033,6 +1047,44 @@ async function addSpreadPages(blob, silent) {
     console.warn('펼침면 분할 실패', e);
     return false;
   }
+}
+
+/* 화면 미회전 감지: 세로형 이미지 가운데에 어두운 "가로" 골짜기가 있으면
+   = 폰만 돌리고 화면은 안 돌아간 상태의 펼침면 (책등이 가로로 누움) */
+function hasHorizontalValley(canvas) {
+  const H = 400;
+  const scale = H / canvas.height;
+  const W = Math.max(8, Math.round(canvas.width * scale));
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const ctx = c.getContext('2d');
+  ctx.drawImage(canvas, 0, 0, W, H);
+  const x0 = Math.round(W * 0.2), cols = Math.max(1, Math.round(W * 0.6));
+  const d = ctx.getImageData(x0, 0, cols, H).data;
+  const row = new Float32Array(H);
+  for (let y = 0; y < H; y++) {
+    let s = 0;
+    for (let x = 0; x < cols; x++) {
+      const i = (y * cols + x) * 4;
+      s += d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114;
+    }
+    row[y] = s / cols;
+  }
+  const sm = new Float32Array(H);
+  for (let y = 0; y < H; y++) {
+    let s = 0, n = 0;
+    for (let k = -2; k <= 2; k++) {
+      const yy = y + k;
+      if (yy >= 0 && yy < H) { s += row[yy]; n++; }
+    }
+    sm[y] = s / n;
+  }
+  let minV = Infinity;
+  for (let y = Math.round(H * 0.35); y <= Math.round(H * 0.65); y++) {
+    if (sm[y] < minV) minV = sm[y];
+  }
+  const sorted = [...sm].sort((a, b) => a - b);
+  return minV < sorted[H >> 1] - 10;
 }
 
 /* 책등(골짜기) 위치: 중앙 30% 구간에서 가장 어두운 세로줄. 뚜렷하지 않으면 중앙 */
