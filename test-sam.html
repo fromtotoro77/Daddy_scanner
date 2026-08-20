@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>SlimSAM 경계 분할 실측</title>
+<style>
+body { background:#0c0c0e; color:#eee; font-family:system-ui; padding:1rem; }
+#log { font-family:monospace; font-size:13px; white-space:pre-wrap; background:#17171a; padding:0.8rem; border-radius:10px; min-height:5rem; }
+canvas { max-width:100%; border-radius:10px; margin-top:0.6rem; }
+</style>
+</head>
+<body>
+<h3>SlimSAM(경량 SAM) — 중앙점 프롬프트 사물 경계 실측</h3>
+<input type="file" id="file" accept="image/*">
+<div id="log">대기…</div>
+<canvas id="out"></canvas>
+<script type="module">
+import { SamModel, AutoProcessor, RawImage } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.4.0';
+
+const logEl = document.getElementById('log');
+let lines = [];
+const log = (m) => { lines.push(m); logEl.textContent = lines.join('\n'); };
+
+let model = null, processor = null;
+const MODEL_ID = 'Xenova/slimsam-77-uniform';
+
+window.samEngine = '?';
+window.loadSam = async function () {
+    const t0 = performance.now();
+    log('모델 로드 중… (' + MODEL_ID + ')');
+    // 1순위 WebGPU(GPU 가속), 실패 시 CPU(wasm q8)
+    try {
+        model = await SamModel.from_pretrained(MODEL_ID, { device: 'webgpu', dtype: 'fp16' });
+        window.samEngine = 'WebGPU (GPU 가속)';
+    } catch (e) {
+        log('WebGPU 불가 → CPU 모드: ' + String(e).slice(0, 90));
+        model = await SamModel.from_pretrained(MODEL_ID, { dtype: 'q8' });
+        window.samEngine = 'CPU (wasm q8)';
+    }
+    processor = await AutoProcessor.from_pretrained(MODEL_ID);
+    log(`모델 로드 완료: ${((performance.now() - t0) / 1000).toFixed(1)}초 / 엔진: ${window.samEngine}`);
+    return window.samEngine;
+};
+
+window.runSam = async function (f) {
+    try {
+        // 헤드리스 createImageBitmap 회피: Image → canvas 경유
+        const url = URL.createObjectURL(f);
+        const im = new Image();
+        await new Promise((ok, ng) => { im.onload = ok; im.onerror = () => ng(new Error('디코딩 실패')); im.src = url; });
+        URL.revokeObjectURL(url);
+        const scale = Math.min(1, 1024 / Math.max(im.width, im.height));
+        const c = document.createElement('canvas');
+        c.width = Math.round(im.width * scale);
+        c.height = Math.round(im.height * scale);
+        c.getContext('2d').drawImage(im, 0, 0, c.width, c.height);
+        const image = await RawImage.fromCanvas(c);
+
+        const cx = c.width / 2, cy = c.height / 2;
+        let t0 = performance.now();
+        const inputs = await processor(image, { input_points: [[[cx, cy]]], input_labels: [[1]] });
+        const tPre = performance.now() - t0;
+        t0 = performance.now();
+        const outputs = await model(inputs);
+        const tInf = performance.now() - t0;
+        const masks = await processor.post_process_masks(outputs.pred_masks, inputs.original_sizes, inputs.reshaped_input_sizes);
+        const scores = outputs.iou_scores.data;
+        // 최고 점수 마스크 선택
+        let bi = 0;
+        for (let i = 1; i < scores.length; i++) if (scores[i] > scores[bi]) bi = i;
+        const mask = masks[0][0][bi]; // [H, W] bool/uint8 tensor
+        const [H, W] = mask.dims.slice(-2);
+
+        // 시각화: 원본 + 마스크 초록 오버레이 + 중앙점
+        const out = document.getElementById('out');
+        out.width = W; out.height = H;
+        const ctx = out.getContext('2d');
+        ctx.drawImage(c, 0, 0, W, H);
+        const od = ctx.getImageData(0, 0, W, H);
+        const md = mask.data;
+        let area = 0;
+        for (let i = 0; i < W * H; i++) {
+            if (md[i]) {
+                area++;
+                od.data[i * 4] = od.data[i * 4] * 0.4;
+                od.data[i * 4 + 1] = Math.min(255, od.data[i * 4 + 1] * 0.5 + 130);
+                od.data[i * 4 + 2] = od.data[i * 4 + 2] * 0.4;
+            }
+        }
+        ctx.putImageData(od, 0, 0);
+        ctx.fillStyle = '#f43f5e';
+        ctx.beginPath(); ctx.arc(cx * W / c.width, cy * H / c.height, 7, 0, 7); ctx.fill();
+        log(`[${window.samEngine}] 전처리 ${(tPre / 1000).toFixed(2)}초 / 추론 ${(tInf / 1000).toFixed(2)}초 / score ${scores[bi].toFixed(3)} / 면적 ${(area / (W * H) * 100).toFixed(1)}%`);
+        log(area / (W * H) < 0.05 ? '⚠ 마스크가 너무 작음 — 중앙점이 작은 물체를 잡았을 수 있음' : '초록 영역이 페이지와 일치하는지 확인하세요');
+        return { ok: true, tPre, tInf, score: scores[bi], areaPct: area / (W * H) * 100, out: out.toDataURL('image/jpeg', 0.85) };
+    } catch (e) {
+        log('오류: ' + e);
+        return { ok: false, err: String(e) };
+    }
+};
+
+document.getElementById('file').onchange = (ev) => {
+    const f = ev.target.files[0];
+    ev.target.value = '';
+    if (f) window.runSam(f);
+};
+</script>
+</body>
+</html>
