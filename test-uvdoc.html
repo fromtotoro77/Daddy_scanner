@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#0c0c0e">
+    <title>UVDoc 성능 측정 — Daddy scanner 실험실</title>
+    <style>
+        :root {
+            --bg: #0c0c0e; --surface: #17171a; --primary: #d4d4d8;
+            --accent: #f43f5e; --text: #f4f4f5; --dim: #8b8b90;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background: var(--bg); color: var(--text);
+            font-family: 'Pretendard', system-ui, sans-serif;
+            padding: 1.2rem; max-width: 640px; margin: 0 auto;
+        }
+        h1 { font-size: 1.15rem; margin-bottom: 0.2rem; }
+        .sub { color: var(--dim); font-size: 0.8rem; margin-bottom: 1.2rem; }
+        button {
+            width: 100%; padding: 0.9rem; margin: 0.35rem 0;
+            background: rgba(255,255,255,0.06); color: var(--text);
+            border: 1px solid rgba(255,255,255,0.12); border-radius: 12px;
+            font-size: 0.95rem; font-weight: 700; cursor: pointer;
+        }
+        button.primary { background: var(--primary); color: #0c0c0e; border: none; }
+        button:disabled { opacity: 0.35; }
+        #log {
+            background: var(--surface); border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 12px; padding: 0.9rem; margin-top: 0.8rem;
+            font-family: monospace; font-size: 0.78rem; line-height: 1.7;
+            white-space: pre-wrap; min-height: 6rem;
+        }
+        .imgs { display: flex; gap: 0.5rem; margin-top: 0.8rem; }
+        .imgs > div { flex: 1; text-align: center; color: var(--dim); font-size: 0.75rem; }
+        canvas { width: 100%; border-radius: 10px; background: var(--surface); }
+        .ok { color: #4ade80; } .warn { color: var(--accent); }
+    </style>
+</head>
+<body>
+    <h1>UVDoc 곡면 평탄화 — 성능 측정</h1>
+    <div class="sub">신경망(30MB) 방식이 이 기기에서 몇 초 걸리는지 실측하는 실험 페이지</div>
+
+    <button id="btn-load" class="primary">1) 모델 다운로드 + 로드 (약 30MB, 최초 1회)</button>
+    <button id="btn-pick" disabled>2) 책 사진 선택 → 평탄화 실행</button>
+    <input type="file" id="file" accept="image/*" hidden>
+
+    <div id="log">대기 중…</div>
+    <div class="imgs">
+        <div><canvas id="cv-in"></canvas>입력</div>
+        <div><canvas id="cv-out"></canvas>평탄화 결과</div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/ort.webgpu.min.js"></script>
+    <script>
+    'use strict';
+    const MODEL_URL = 'https://huggingface.co/PaddlePaddle/UVDoc_onnx/resolve/main/inference.onnx';
+    const IN_W = 488, IN_H = 712; // UVDoc 표준 입력 (세로 문서)
+    const logEl = document.getElementById('log');
+    let lines = [];
+    function log(msg, cls) {
+        lines.push(cls ? `<span class="${cls}">${msg}</span>` : msg);
+        logEl.innerHTML = lines.join('\n');
+    }
+    ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/';
+
+    let session = null, epUsed = '?';
+
+    async function fetchModel() {
+        const cache = await caches.open('uvdoc-test');
+        const hit = await cache.match(MODEL_URL);
+        if (hit) { log('모델: 캐시에서 로드'); return await hit.arrayBuffer(); }
+        const t0 = performance.now();
+        const res = await fetch(MODEL_URL);
+        if (!res.ok) throw new Error('모델 다운로드 실패 ' + res.status);
+        const reader = res.body.getReader();
+        const total = +res.headers.get('content-length') || 0;
+        const chunks = []; let got = 0;
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value); got += value.length;
+            if (total) {
+                lines[lines.length - 1] = `다운로드 중… ${(got/1048576).toFixed(1)} / ${(total/1048576).toFixed(1)} MB`;
+                logEl.innerHTML = lines.join('\n');
+            }
+        }
+        const buf = new Blob(chunks).arrayBuffer();
+        const ab = await buf;
+        log(`다운로드 완료: ${(got/1048576).toFixed(1)}MB, ${((performance.now()-t0)/1000).toFixed(1)}초`);
+        try { await cache.put(MODEL_URL, new Response(ab.slice(0), { headers: { 'Content-Type': 'application/octet-stream' } })); } catch (e) {}
+        return ab;
+    }
+
+    document.getElementById('btn-load').onclick = async () => {
+        try {
+            document.getElementById('btn-load').disabled = true;
+            lines = []; log('모델 준비 중…');
+            const buf = await fetchModel();
+            let t0 = performance.now();
+            try {
+                session = await ort.InferenceSession.create(buf.slice(0), { executionProviders: ['webgpu'] });
+                epUsed = 'WebGPU (GPU 가속)';
+            } catch (e) {
+                log('WebGPU 불가 → CPU(WASM)로 전환', 'warn');
+                session = await ort.InferenceSession.create(buf.slice(0), { executionProviders: ['wasm'] });
+                epUsed = 'WASM (CPU)';
+            }
+            log(`세션 생성: ${((performance.now()-t0)/1000).toFixed(1)}초 / 엔진: ${epUsed}`, 'ok');
+            log(`입력: ${session.inputNames[0]} / 출력: ${session.outputNames[0]}`);
+            document.getElementById('btn-pick').disabled = false;
+        } catch (e) {
+            log('오류: ' + e.message, 'warn');
+            document.getElementById('btn-load').disabled = false;
+        }
+    };
+
+    document.getElementById('btn-pick').onclick = () => document.getElementById('file').click();
+    document.getElementById('file').onchange = (ev) => {
+        const f = ev.target.files[0];
+        ev.target.value = '';
+        if (f) runInference(f);
+    };
+    window.runInference = async function (f) {
+        try {
+            log('사진 처리 시작…');
+            const url = URL.createObjectURL(f);
+            const im = new Image();
+            await new Promise((res, rej) => { im.onload = res; im.onerror = () => rej(new Error('이미지 디코딩 실패')); im.src = url; });
+            URL.revokeObjectURL(url);
+            const cin = document.getElementById('cv-in');
+            cin.width = IN_W; cin.height = IN_H;
+            cin.getContext('2d').drawImage(im, 0, 0, IN_W, IN_H);
+
+            // 전처리: RGB /255 → CHW
+            let t0 = performance.now();
+            const d = cin.getContext('2d').getImageData(0, 0, IN_W, IN_H).data;
+            const n = IN_W * IN_H;
+            const input = new Float32Array(3 * n);
+            for (let i = 0; i < n; i++) {
+                input[i] = d[i * 4] / 255;
+                input[n + i] = d[i * 4 + 1] / 255;
+                input[2 * n + i] = d[i * 4 + 2] / 255;
+            }
+            const tensor = new ort.Tensor('float32', input, [1, 3, IN_H, IN_W]);
+            const tPre = performance.now() - t0;
+            log(`전처리 ${tPre.toFixed(0)}ms — 추론 1회차 실행 중… (엔진: ${epUsed})`);
+
+            // 1회차(워밍업/컴파일 포함) + 2회차(실측)
+            t0 = performance.now();
+            let out = await session.run({ [session.inputNames[0]]: tensor });
+            const t1 = performance.now() - t0;
+            log(`1회차 ${(t1/1000).toFixed(2)}초 — 2회차 실행 중…`);
+            t0 = performance.now();
+            out = await session.run({ [session.inputNames[0]]: tensor });
+            const t2 = performance.now() - t0;
+
+            const o = out[session.outputNames[0]];
+            log(`전처리 ${tPre.toFixed(0)}ms / 추론 1회차 ${(t1/1000).toFixed(2)}초 · 2회차 ${(t2/1000).toFixed(2)}초 (${epUsed})`, 'ok');
+            log(`출력 형태: [${o.dims.join(', ')}]`);
+
+            // 출력 [1,3,H,W] float 0~1 → 캔버스
+            const [, , oh, ow] = o.dims;
+            const on = ow * oh;
+            const img = new ImageData(ow, oh);
+            const od = o.data;
+            for (let i = 0; i < on; i++) {
+                img.data[i * 4] = Math.max(0, Math.min(255, od[i] * 255));
+                img.data[i * 4 + 1] = Math.max(0, Math.min(255, od[on + i] * 255));
+                img.data[i * 4 + 2] = Math.max(0, Math.min(255, od[2 * on + i] * 255));
+                img.data[i * 4 + 3] = 255;
+            }
+            const cout = document.getElementById('cv-out');
+            cout.width = ow; cout.height = oh;
+            cout.getContext('2d').putImageData(img, 0, 0);
+            log('완료 — 결과 이미지를 확인하세요', 'ok');
+        } catch (e) {
+            log('추론 오류: ' + e.message, 'warn');
+        }
+    };
+    </script>
+</body>
+</html>
