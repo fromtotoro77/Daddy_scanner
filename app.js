@@ -209,8 +209,50 @@ function paperMask(srcRgba) {
   return mask;
 }
 
+/* 어두운 가는 선(책 가장자리 그림자·표 선·글자)을 마스크에서 제거 — 흰 책 위 흰 책 분리용 차단벽 */
+function subtractDarkLines(blurGray, mask) {
+  const k = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(11, 11));
+  const bh = new cv.Mat();
+  cv.morphologyEx(blurGray, bh, cv.MORPH_BLACKHAT, k);
+  const bar = new cv.Mat();
+  cv.threshold(bh, bar, 16, 255, cv.THRESH_BINARY);
+  cv.subtract(mask, bar, mask);
+  k.delete(); bh.delete(); bar.delete();
+}
+
+/* 중앙(사용자가 겨눈 지점)이 속한 연결 성분만 골라 사각형 추출
+   — 흰 책이 겹쳐 있어도 그림자 차단벽으로 갈라진 뒤 "겨눈 책"만 선택된다 */
+function centerComponentQuad(bin, imgArea, minRatio) {
+  const H = bin.rows, W = bin.cols;
+  let seed = null;
+  for (let r = 0; r < 48 && !seed; r += 4) {
+    for (const [dx, dy] of [[0, 0], [r, 0], [-r, 0], [0, r], [0, -r], [r, r], [-r, -r], [r, -r], [-r, r]]) {
+      const x = (W >> 1) + dx, y = (H >> 1) + dy;
+      if (x >= 0 && y >= 0 && x < W && y < H && bin.ucharPtr(y, x)[0] > 0) { seed = [x, y]; break; }
+    }
+  }
+  if (!seed) return null;
+  const ffMask = cv.Mat.zeros(H + 2, W + 2, cv.CV_8U);
+  try {
+    cv.floodFill(bin, ffMask, new cv.Point(seed[0], seed[1]), new cv.Scalar(255),
+      new cv.Rect(), new cv.Scalar(0), new cv.Scalar(0), 4 | (255 << 8) | cv.FLOODFILL_MASK_ONLY);
+  } catch (e) {
+    ffMask.delete();
+    return null;
+  }
+  const roi = ffMask.roi(new cv.Rect(1, 1, W, H));
+  const comp = roi.clone();
+  roi.delete(); ffMask.delete();
+  const best = scanQuads(comp, imgArea, minRatio, 0.97, null);
+  comp.delete();
+  return best;
+}
+
 /* 캔버스에서 문서 사각형 감지 → {tl,tr,br,bl} (캔버스 좌표) 또는 null
-   전략: ①종이색 마스크(중앙 기준) → ②밝기 이진화 → ③④엣지. 모두 "중앙 포함" 후보만 인정 */
+   전략(각 베이스 마스크마다):
+   ① 그림자 차단벽 절단 + 중앙 성분 선택 — 겹친 흰 책·잡동사니에 가장 강함
+   ② 가로띠 메꿈(스프링 제본) + 중앙 포함 최대 사각형
+   베이스: 종이색 마스크 → 밝기 이진화, 이후 엣지 폴백 */
 function findDocQuad(canvas, minRatio = 0.15) {
   const src = cv.imread(canvas);
   const imgArea = src.cols * src.rows;
@@ -222,34 +264,41 @@ function findDocQuad(canvas, minRatio = 0.15) {
   const bin = new cv.Mat();
   const kernel = cv.Mat.ones(3, 3, cv.CV_8U);
   let best = null;
-  try {
-    // 1차: 종이색 마스크 — 주변 잡동사니(밝은 물체·컬러 물체)에 가장 강함
-    const pm = paperMask(src);
-    if (pm) {
-      healHorizontalBands(pm);
-      cv.morphologyEx(pm, pm, cv.MORPH_CLOSE, kernel, new cv.Point(-1, -1), 2);
-      cv.erode(pm, pm, kernel, new cv.Point(-1, -1), 1);
-      best = scanQuads(pm, imgArea, minRatio, 0.97, center);
-      pm.delete();
+  const pt = new cv.Point(-1, -1);
+  const tryBase = (base) => {
+    if (!best) {
+      const a = base.clone();
+      subtractDarkLines(blur, a);
+      cv.morphologyEx(a, a, cv.MORPH_CLOSE, kernel, pt, 1);
+      cv.erode(a, a, kernel, pt, 1);
+      best = centerComponentQuad(a, imgArea, minRatio);
+      a.delete();
     }
-    // 2차: 밝기 이진화(Otsu) — 표/글자는 종이 안쪽이라 외곽에 영향 없음
+    if (!best) {
+      const b2 = base.clone();
+      healHorizontalBands(b2);
+      cv.morphologyEx(b2, b2, cv.MORPH_CLOSE, kernel, pt, 2);
+      cv.erode(b2, b2, kernel, pt, 1);
+      best = scanQuads(b2, imgArea, minRatio, 0.97, center);
+      b2.delete();
+    }
+  };
+  try {
+    const pm = paperMask(src);
+    if (pm) { tryBase(pm); pm.delete(); }
     if (!best) {
       cv.threshold(blur, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
-      healHorizontalBands(bin);
-      cv.morphologyEx(bin, bin, cv.MORPH_CLOSE, kernel, new cv.Point(-1, -1), 2);
-      cv.erode(bin, bin, kernel, new cv.Point(-1, -1), 1);
-      best = scanQuads(bin, imgArea, minRatio, 0.97, center);
+      tryBase(bin);
     }
-    // 3차: 표준 엣지 (종이와 배경 밝기가 비슷할 때)
+    // 엣지 폴백 (종이와 배경 밝기가 비슷할 때)
     if (!best) {
       cv.Canny(blur, bin, 60, 180);
-      cv.dilate(bin, bin, kernel, new cv.Point(-1, -1), 2);
+      cv.dilate(bin, bin, kernel, pt, 2);
       best = scanQuads(bin, imgArea, minRatio, 0.985, center);
     }
-    // 4차: 저대비 엣지
     if (!best) {
       cv.Canny(blur, bin, 20, 70);
-      cv.dilate(bin, bin, kernel, new cv.Point(-1, -1), 2);
+      cv.dilate(bin, bin, kernel, pt, 2);
       best = scanQuads(bin, imgArea, minRatio, 0.985, center);
     }
   } catch (e) {
