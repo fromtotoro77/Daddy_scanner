@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>정답 경계 라벨링 도구</title>
+<style>
+body { background:#0c0c0e; color:#eee; font-family:system-ui; padding:1rem; max-width:1200px; margin:0 auto; }
+#status { font-size:1.05rem; font-weight:700; color:#4ade80; padding:0.6rem 0; }
+button { padding:0.6rem 1.1rem; margin:0.2rem; background:rgba(255,255,255,0.08); color:#eee;
+         border:1px solid rgba(255,255,255,0.2); border-radius:10px; font-weight:700; cursor:pointer; }
+button.primary { background:#d4d4d8; color:#0c0c0e; }
+canvas { max-width:100%; border-radius:10px; cursor:crosshair; }
+#done { font-family:monospace; font-size:12px; color:#8b8b90; margin-top:0.5rem; }
+input[type=file] { padding:0.5rem; }
+</style>
+</head>
+<body>
+<h3>책 경계 정답 그리기 (1~4.jpg)</h3>
+<div>
+  <input type="file" id="file" accept="image/*">
+</div>
+<div>
+  <button id="btnUndo">↩ 마지막 점 취소</button>
+  <button id="btnEdgeDone">이 테두리 완료 →</button>
+  <button id="btnSave">이 사진 저장</button>
+  <button id="btnCopy" class="primary">📋 전체 JSON 복사</button>
+</div>
+<div id="status">위의 파일 선택으로 1.jpg부터 여세요</div>
+<canvas id="cvs"></canvas>
+<div id="done">저장된 사진: 없음</div>
+<script>
+'use strict';
+(function () {
+  var cvs = document.getElementById('cvs');
+  var ctx = cvs.getContext('2d');
+  var statusEl = document.getElementById('status');
+  var allData = {};
+  var img = null, fname = '', scl = 1;
+  var stage = 0;
+  var cornerPts = [], topPts = [], botPts = [];
+
+  var STAGES = [
+    '① 좌상단 모서리를 클릭',
+    '② 우상단 모서리를 클릭',
+    '③ 우하단 모서리를 클릭',
+    '④ 좌하단 모서리를 클릭',
+    '⑤ 상단 테두리를 왼→오른쪽으로 5~8번 클릭 (곡선이면 곡선 따라) 후 [이 테두리 완료]',
+    '⑥ 하단 테두리를 왼→오른쪽으로 5~8번 클릭 후 [이 사진 저장]',
+  ];
+
+  function setStatus(msg) {
+    statusEl.textContent = msg || ((fname ? fname + '  ' : '') + STAGES[Math.min(stage, 5)]);
+  }
+
+  function dot(p, color) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(p.x * scl, p.y * scl, 6, 0, 7);
+    ctx.fill();
+  }
+  function line(pts, color) {
+    if (pts.length < 2) return;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x * scl, pts[0].y * scl);
+    for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x * scl, pts[i].y * scl);
+    ctx.stroke();
+  }
+  function redraw() {
+    if (!img) return;
+    ctx.drawImage(img, 0, 0, cvs.width, cvs.height);
+    cornerPts.forEach(function (p) { dot(p, '#f43f5e'); });
+    if (cornerPts.length === 4) {
+      line([cornerPts[0], cornerPts[3]], '#60a5fa');
+      line([cornerPts[1], cornerPts[2]], '#60a5fa');
+    }
+    line(topPts, '#4ade80'); topPts.forEach(function (p) { dot(p, '#4ade80'); });
+    line(botPts, '#facc15'); botPts.forEach(function (p) { dot(p, '#facc15'); });
+  }
+
+  document.getElementById('file').addEventListener('change', function (ev) {
+    var f = ev.target.files[0];
+    ev.target.value = '';
+    if (!f) return;
+    fname = f.name;
+    var url = URL.createObjectURL(f);
+    img = new Image();
+    img.onload = function () {
+      URL.revokeObjectURL(url);
+      var maxW = Math.min(1100, window.innerWidth - 40);
+      scl = Math.min(1, maxW / img.naturalWidth, 1400 / img.naturalHeight);
+      cvs.width = Math.round(img.naturalWidth * scl);
+      cvs.height = Math.round(img.naturalHeight * scl);
+      stage = 0; cornerPts = []; topPts = []; botPts = [];
+      redraw(); setStatus();
+    };
+    img.onerror = function () { setStatus('이미지 로드 실패'); };
+    img.src = url;
+  });
+
+  cvs.addEventListener('click', function (e) {
+    if (!img || stage > 5) return;
+    var r = cvs.getBoundingClientRect();
+    var p = {
+      x: Math.round(((e.clientX - r.left) * (cvs.width / r.width)) / scl * 10) / 10,
+      y: Math.round(((e.clientY - r.top) * (cvs.height / r.height)) / scl * 10) / 10,
+    };
+    if (stage <= 3) { cornerPts.push(p); stage++; }
+    else if (stage === 4) topPts.push(p);
+    else botPts.push(p);
+    redraw(); setStatus();
+  });
+
+  document.getElementById('btnUndo').addEventListener('click', function () {
+    if (stage === 5 && botPts.length) botPts.pop();
+    else if (stage === 5) stage = 4;
+    else if (stage === 4 && topPts.length) topPts.pop();
+    else if (stage === 4) { stage = 3; cornerPts.pop(); }
+    else if (cornerPts.length) { cornerPts.pop(); stage--; }
+    redraw(); setStatus();
+  });
+
+  document.getElementById('btnEdgeDone').addEventListener('click', function () {
+    if (stage === 4 && topPts.length >= 3) { stage = 5; setStatus(); }
+    else if (stage === 4) alert('상단 테두리를 3번 이상 클릭해 주세요');
+  });
+
+  document.getElementById('btnSave').addEventListener('click', function () {
+    if (stage !== 5 || botPts.length < 3) { alert('하단 테두리를 3번 이상 클릭해 주세요'); return; }
+    allData[fname] = {
+      w: img.naturalWidth, h: img.naturalHeight,
+      corners: { tl: cornerPts[0], tr: cornerPts[1], br: cornerPts[2], bl: cornerPts[3] },
+      top: [cornerPts[0]].concat(topPts, [cornerPts[1]]),
+      bottom: [cornerPts[3]].concat(botPts, [cornerPts[2]]),
+    };
+    document.getElementById('done').textContent = '저장된 사진: ' + Object.keys(allData).join(', ');
+    setStatus(fname + ' 저장됨! 파일 선택으로 다음 사진을 여세요');
+    img = null;
+    ctx.clearRect(0, 0, cvs.width, cvs.height);
+  });
+
+  document.getElementById('btnCopy').addEventListener('click', function () {
+    var t = JSON.stringify(allData);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(t).then(
+        function () { alert('복사됨! 대화창에 붙여넣어 주세요.'); },
+        function () { prompt('아래 내용을 복사하세요:', t); });
+    } else {
+      prompt('아래 내용을 복사하세요:', t);
+    }
+  });
+
+  setStatus('위의 파일 선택으로 1.jpg부터 여세요');
+})();
+</script>
+</body>
+</html>
