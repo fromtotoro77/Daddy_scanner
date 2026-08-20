@@ -209,7 +209,8 @@ function paperMask(srcRgba) {
   return mask;
 }
 
-/* 어두운 가는 선(책 가장자리 그림자·표 선·글자)을 마스크에서 제거 — 흰 책 위 흰 책 분리용 차단벽 */
+/* 어두운 가는 선(책 가장자리 그림자·표 선·글자) + 엣지를 마스크에서 제거
+   — 흰 책 위 흰 책, 흰 책상 위 흰 문서를 flood가 넘어가지 못하게 하는 차단벽 */
 function subtractDarkLines(blurGray, mask) {
   const k = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(11, 11));
   const bh = new cv.Mat();
@@ -217,7 +218,38 @@ function subtractDarkLines(blurGray, mask) {
   const bar = new cv.Mat();
   cv.threshold(bh, bar, 16, 255, cv.THRESH_BINARY);
   cv.subtract(mask, bar, mask);
-  k.delete(); bh.delete(); bar.delete();
+  // 그림자 없는 경계(흰 책상 위 흰 문서의 가장자리)도 차단
+  cv.Canny(blurGray, bh, 30, 90);
+  const k3 = cv.Mat.ones(3, 3, cv.CV_8U);
+  cv.dilate(bh, bh, k3, new cv.Point(-1, -1), 1);
+  cv.subtract(mask, bh, mask);
+  k.delete(); bh.delete(); bar.delete(); k3.delete();
+}
+
+/* 후보 사각형 채점: 네 변을 따라 실제 이미지 경계(그라디언트)가 존재하는 비율.
+   병합된 가짜 사각형은 경계 없는 허공을 가로지르므로 낮은 점수를 받는다 */
+function edgeSupport(grad, q) {
+  const edges = [[q.tl, q.tr], [q.tr, q.br], [q.br, q.bl], [q.bl, q.tl]];
+  let hit = 0, n = 0;
+  for (const [a, b] of edges) {
+    for (let i = 1; i < 16; i++) {
+      const t = i / 16;
+      const x = Math.round(a.x + (b.x - a.x) * t);
+      const y = Math.round(a.y + (b.y - a.y) * t);
+      let m = 0;
+      for (let dy = -2; dy <= 2; dy++) {
+        for (let dx = -2; dx <= 2; dx++) {
+          const xx = x + dx, yy = y + dy;
+          if (xx >= 0 && yy >= 0 && xx < grad.cols && yy < grad.rows) {
+            m = Math.max(m, grad.ucharPtr(yy, xx)[0]);
+          }
+        }
+      }
+      n++;
+      if (m > 18) hit++;
+    }
+  }
+  return n ? hit / n : 0;
 }
 
 /* 중앙(사용자가 겨눈 지점)이 속한 연결 성분만 골라 사각형 추출
@@ -253,7 +285,7 @@ function centerComponentQuad(bin, imgArea, minRatio) {
    ① 그림자 차단벽 절단 + 중앙 성분 선택 — 겹친 흰 책·잡동사니에 가장 강함
    ② 가로띠 메꿈(스프링 제본) + 중앙 포함 최대 사각형
    베이스: 종이색 마스크 → 밝기 이진화, 이후 엣지 폴백 */
-function findDocQuad(canvas, minRatio = 0.15) {
+function findDocQuad(canvas, minRatio = 0.15, borderPenalty = true) {
   const src = cv.imread(canvas);
   const imgArea = src.cols * src.rows;
   const center = new cv.Point(src.cols / 2, src.rows / 2);
@@ -263,43 +295,61 @@ function findDocQuad(canvas, minRatio = 0.15) {
   cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
   const bin = new cv.Mat();
   const kernel = cv.Mat.ones(3, 3, cv.CV_8U);
-  let best = null;
   const pt = new cv.Point(-1, -1);
+  const cands = []; // 우선순위 순서대로 수집 → 경계 지지도로 검증
+  const push = (r, tag) => { if (r) cands.push({ quad: r.quad, contour: r.contour, tag }); };
   const tryBase = (base) => {
-    if (!best) {
-      const a = base.clone();
-      subtractDarkLines(blur, a);
-      cv.morphologyEx(a, a, cv.MORPH_CLOSE, kernel, pt, 1);
-      cv.erode(a, a, kernel, pt, 1);
-      best = centerComponentQuad(a, imgArea, minRatio);
-      a.delete();
-    }
-    if (!best) {
-      const b2 = base.clone();
-      healHorizontalBands(b2);
-      cv.morphologyEx(b2, b2, cv.MORPH_CLOSE, kernel, pt, 2);
-      cv.erode(b2, b2, kernel, pt, 1);
-      best = scanQuads(b2, imgArea, minRatio, 0.97, center);
-      b2.delete();
-    }
+    const a = base.clone();
+    subtractDarkLines(blur, a);
+    cv.morphologyEx(a, a, cv.MORPH_CLOSE, kernel, pt, 1);
+    cv.erode(a, a, kernel, pt, 1);
+    push(centerComponentQuad(a, imgArea, minRatio), 'barrier');
+    a.delete();
+    const b2 = base.clone();
+    healHorizontalBands(b2);
+    cv.morphologyEx(b2, b2, cv.MORPH_CLOSE, kernel, pt, 2);
+    cv.erode(b2, b2, kernel, pt, 1);
+    push(scanQuads(b2, imgArea, minRatio, 0.97, center), 'healed');
+    b2.delete();
   };
+  let best = null;
   try {
     const pm = paperMask(src);
     if (pm) { tryBase(pm); pm.delete(); }
-    if (!best) {
-      cv.threshold(blur, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
-      tryBase(bin);
-    }
-    // 엣지 폴백 (종이와 배경 밝기가 비슷할 때)
-    if (!best) {
-      cv.Canny(blur, bin, 60, 180);
-      cv.dilate(bin, bin, kernel, pt, 2);
-      best = scanQuads(bin, imgArea, minRatio, 0.985, center);
-    }
-    if (!best) {
-      cv.Canny(blur, bin, 20, 70);
-      cv.dilate(bin, bin, kernel, pt, 2);
-      best = scanQuads(bin, imgArea, minRatio, 0.985, center);
+    cv.threshold(blur, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+    tryBase(bin);
+    cv.Canny(blur, bin, 60, 180);
+    cv.dilate(bin, bin, kernel, pt, 2);
+    push(scanQuads(bin, imgArea, minRatio, 0.985, center), 'canny1');
+    cv.Canny(blur, bin, 20, 70);
+    cv.dilate(bin, bin, kernel, pt, 2);
+    push(scanQuads(bin, imgArea, minRatio, 0.985, center), 'canny2');
+
+    if (cands.length) {
+      // 그라디언트 맵으로 "실제 경계 위에 놓인 사각형"인지 검증
+      const gx = new cv.Mat(), gy = new cv.Mat(), grad = new cv.Mat();
+      cv.Sobel(blur, gx, cv.CV_16S, 1, 0, 3);
+      cv.Sobel(blur, gy, cv.CV_16S, 0, 1, 3);
+      cv.convertScaleAbs(gx, gx);
+      cv.convertScaleAbs(gy, gy);
+      cv.addWeighted(gx, 0.5, gy, 0.5, 0, grad);
+      gx.delete(); gy.delete();
+      for (const c of cands) {
+        c.support = edgeSupport(grad, c.quad);
+        c.score = c.support;
+        // 화면 가장자리에 붙은 후보 감점 — 책배·책상 등으로 번진 병합 영역일 가능성
+        // (펼침면 절반 캔버스처럼 경계 접촉이 정상인 경우는 호출측에서 끔)
+        if (borderPenalty) {
+          const m = 3, Wc = src.cols - 1 - m, Hc = src.rows - 1 - m;
+          const touched = [c.quad.tl, c.quad.tr, c.quad.br, c.quad.bl]
+            .some((p) => p.x <= m || p.y <= m || p.x >= Wc || p.y >= Hc);
+          if (touched) c.score -= 0.35;
+        }
+      }
+      grad.delete();
+      // 우선순위(수집 순서)대로, 점수가 충분한 첫 후보 채택.
+      // 전부 부실하면 점수 최고를 채택 (병합 오감지가 우선순위만으로 뽑히는 것 방지)
+      best = cands.find((c) => c.score >= 0.55) || cands.reduce((m2, c) => (c.score > m2.score ? c : m2));
     }
   } catch (e) {
     console.warn('findDocQuad 실패', e);
@@ -349,37 +399,60 @@ function fitEdgeCurve(contour, A, B, quad) {
     bins[bi].push(d);
   }
 
-  const dev = new Array(K + 1).fill(null);
-  let filled = 0;
+  const samples = [];
   for (let i = 0; i <= K; i++) {
     if (bins[i].length) {
       bins[i].sort((a, b) => a - b);
-      dev[i] = bins[i][bins[i].length >> 1]; // 중앙값 (이상치 강건)
-      filled++;
+      samples.push({ t: i / K, d: bins[i][bins[i].length >> 1] }); // 구간 중앙값 (이상치 강건)
     }
   }
-  if (filled < 6) return null;
-  dev[0] = 0; dev[K] = 0; // 끝점은 모서리에 고정
-  // 빈 구간 선형 보간
-  for (let i = 1; i < K; i++) {
-    if (dev[i] !== null) continue;
-    let j = i + 1;
-    while (dev[j] === null) j++;
-    const prev = dev[i - 1];
-    for (let k = i; k < j; k++) dev[k] = prev + ((dev[j] - prev) * (k - i + 1)) / (j - i + 1);
-  }
-  // 3점 이동평균 평활
-  const sm = dev.slice();
-  for (let i = 1; i < K; i++) sm[i] = (dev[i - 1] + dev[i] + dev[i + 1]) / 3;
+  if (samples.length < 6) return null;
+
+  // 베지어 파라미터 곡률(vFlat 특허 방식): 끝점 0 고정 3차 베지어(제어값 2개)로 피팅
+  // → 수학적으로 매끈한 곡선만 허용되어 잔물결·감지 노이즈가 원리적으로 제거됨
+  const bez = fitBezierDeviation(samples);
+  if (!bez) return null;
 
   // 휨이 미미하면 직선 취급 (불필요한 리맵 방지)
-  const maxDev = Math.max(...sm.map(Math.abs));
+  let maxDev = 0;
+  for (let i = 0; i <= K; i++) maxDev = Math.max(maxDev, Math.abs(bez(i / K)));
   if (maxDev < Math.max(2.5, L * 0.012)) return null;
 
-  return sm.map((d, i) => {
+  return Array.from({ length: K + 1 }, (_, i) => {
     const t = i / K;
+    const d = bez(t);
     return { x: A.x + t * ex + d * nx, y: A.y + t * ey + d * ny };
   });
+}
+
+/* 끝점 0 고정 3차 베지어 편차 곡선의 최소자승 피팅 (+ 이상치 1회 제거 후 재피팅)
+   d(t) = 3(1-t)²t·c1 + 3(1-t)t²·c2  — 제어값 c1, c2 두 개가 곡률의 전부 */
+function fitBezierDeviation(samples) {
+  const f1 = (t) => 3 * (1 - t) * (1 - t) * t;
+  const f2 = (t) => 3 * (1 - t) * t * t;
+  const solve = (pts) => {
+    let S11 = 0, S12 = 0, S22 = 0, b1 = 0, b2 = 0;
+    for (const { t, d } of pts) {
+      const a = f1(t), b = f2(t);
+      S11 += a * a; S12 += a * b; S22 += b * b;
+      b1 += a * d; b2 += b * d;
+    }
+    const det = S11 * S22 - S12 * S12;
+    if (Math.abs(det) < 1e-9) return null;
+    return [(b1 * S22 - b2 * S12) / det, (b2 * S11 - b1 * S12) / det];
+  };
+  let c = solve(samples);
+  if (!c) return null;
+  // 이상치(감지 튐) 1회 제거 후 재피팅
+  const res = samples.map(({ t, d }) => Math.abs(d - (f1(t) * c[0] + f2(t) * c[1])));
+  const med = [...res].sort((x, y) => x - y)[res.length >> 1] || 0;
+  const kept = samples.filter((_, i) => res[i] <= Math.max(3, med * 3));
+  if (kept.length >= 5 && kept.length < samples.length) {
+    const c2 = solve(kept);
+    if (c2) c = c2;
+  }
+  const [c1, c2v] = c;
+  return (t) => f1(t) * c1 + f2(t) * c2v;
 }
 
 function sampleLine(A, B, n) {
@@ -389,16 +462,27 @@ function sampleLine(A, B, n) {
   });
 }
 
-/* 윤곽선 + 사각형 → 상·하 곡선 (휨이 없으면 null) */
+/* 윤곽선 + 사각형 → 네 변 곡선 (휘어진 변은 곡선으로, 반듯한 변은 직선으로. 전부 직선이면 null) */
 function extractCurves(contour, quad) {
   if (!contour || contour.length < 12) return null;
   const top = fitEdgeCurve(contour, quad.tl, quad.tr, quad);
   const bottom = fitEdgeCurve(contour, quad.bl, quad.br, quad);
-  if (!top && !bottom) return null;
+  const left = fitEdgeCurve(contour, quad.tl, quad.bl, quad);
+  const right = fitEdgeCurve(contour, quad.tr, quad.br, quad);
+  if (!top && !bottom && !left && !right) return null;
   return {
     top: top || sampleLine(quad.tl, quad.tr, CURVE_SAMPLES),
     bottom: bottom || sampleLine(quad.bl, quad.br, CURVE_SAMPLES),
+    left: left || sampleLine(quad.tl, quad.bl, CURVE_SAMPLES),
+    right: right || sampleLine(quad.tr, quad.br, CURVE_SAMPLES),
   };
+}
+
+/* 곡선 묶음({top,bottom,left,right,…})의 모든 점에 좌표 변환 적용 */
+function mapCurvePoints(curves, fn) {
+  const o = {};
+  for (const k in curves) o[k] = curves[k].map(fn);
+  return o;
 }
 
 function polylineLen(pts) {
@@ -429,22 +513,32 @@ function resamplePolyline(pts, n) {
   return out;
 }
 
-/* 곡선 경계 메시 리맵 — 촬영 순간 곡면까지 평탄화 */
+/* 곡선 경계 메시 리맵 — 네 변 곡선을 모두 반영하는 Coons 패치. 촬영 순간 곡면까지 평탄화 */
 function warpCurved(canvas, quad, curves) {
   const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  const leftC = curves.left || sampleLine(quad.tl, quad.bl, CURVE_SAMPLES);   // 구버전 저장 데이터 호환
+  const rightC = curves.right || sampleLine(quad.tr, quad.br, CURVE_SAMPLES);
   const W = Math.max(24, Math.min(canvas.width * 2, Math.round(Math.max(polylineLen(curves.top), polylineLen(curves.bottom)))));
-  const H = Math.max(24, Math.min(canvas.height * 2, Math.round(Math.max(dist(quad.tl, quad.bl), dist(quad.tr, quad.br)))));
+  const H = Math.max(24, Math.min(canvas.height * 2, Math.round(Math.max(polylineLen(leftC), polylineLen(rightC)))));
   const top = resamplePolyline(curves.top, W);
   const bot = resamplePolyline(curves.bottom, W);
+  const lft = resamplePolyline(leftC, H);
+  const rgt = resamplePolyline(rightC, H);
+  const { tl, tr, br, bl } = quad;
   const mapX = new cv.Mat(H, W, cv.CV_32FC1);
   const mapY = new cv.Mat(H, W, cv.CV_32FC1);
   const mx = mapX.data32F, my = mapY.data32F;
   for (let y = 0; y < H; y++) {
-    const s = y / (H - 1);
+    const s = y / (H - 1), is = 1 - s;
+    const L = lft[y], R = rgt[y];
     const row = y * W;
     for (let x = 0; x < W; x++) {
-      mx[row + x] = top[x].x + s * (bot[x].x - top[x].x);
-      my[row + x] = top[x].y + s * (bot[x].y - top[x].y);
+      const t = x / (W - 1), it = 1 - t;
+      // Coons 패치: 상하 보간 + 좌우 보간 - 코너 이중계산 보정
+      mx[row + x] = is * top[x].x + s * bot[x].x + it * L.x + t * R.x
+        - (is * it * tl.x + is * t * tr.x + s * it * bl.x + s * t * br.x);
+      my[row + x] = is * top[x].y + s * bot[x].y + it * L.y + t * R.y
+        - (is * it * tl.y + is * t * tr.y + s * it * bl.y + s * t * br.y);
     }
   }
   const src = cv.imread(canvas);
@@ -493,7 +587,7 @@ async function detectCorners(page) {
     if (corners) {
       const up = (p) => ({ x: p.x / scale, y: p.y / scale }); // 감지 좌표 → 원본 좌표
       page.corners = { tl: up(corners.tl), tr: up(corners.tr), br: up(corners.br), bl: up(corners.bl) };
-      page.curves = curves ? { top: curves.top.map(up), bottom: curves.bottom.map(up) } : null;
+      page.curves = curves ? mapCurvePoints(curves, up) : null;
       page.thumbDirty = true;
     }
     persistPage(page);
@@ -539,7 +633,7 @@ async function processPage(page, maxSide) {
       const sc = { tl: dn(page.corners.tl), tr: dn(page.corners.tr), br: dn(page.corners.br), bl: dn(page.corners.bl) };
       try {
         if (page.curves) {
-          const cs = { top: page.curves.top.map(dn), bottom: page.curves.bottom.map(dn) };
+          const cs = mapCurvePoints(page.curves, dn);
           src = warpCurved(src, sc, cs); // 곡선 경계 메시 워프 — 책 곡면까지 폄
         } else {
           src = warpPerspective(src, sc);
@@ -900,11 +994,24 @@ function startLiveOverlay() {
         const fit = Math.min(cw / vw, ch / vh);
         const ox = (cw - vw * fit) / 2, oy = (ch - vh * fit) / 2;
         const map = (p) => [(p.x / s) * fit + ox, (p.y / s) * fit + oy];
-        const pts = ['tl', 'tr', 'br', 'bl'].map((k) => map(liveDetect.quad[k]));
         const color = stable ? 'rgba(74, 222, 128, 0.95)' : 'rgba(74, 222, 128, 0.45)';
         octx.beginPath();
-        octx.moveTo(pts[0][0], pts[0][1]);
-        for (let i = 1; i < 4; i++) octx.lineTo(pts[i][0], pts[i][1]);
+        if (liveDetect.curves) {
+          // 곡선 윤곽 가이드: 휘어진 변은 곡선 그대로, 반듯한 변은 직선으로
+          const cvs = liveDetect.curves;
+          const path = [
+            ...cvs.top.map(map),                                  // tl → tr
+            ...(cvs.right || [liveDetect.quad.tr, liveDetect.quad.br]).map(map), // tr → br
+            ...cvs.bottom.slice().reverse().map(map),             // br → bl
+            ...(cvs.left || [liveDetect.quad.tl, liveDetect.quad.bl]).slice().reverse().map(map), // bl → tl
+          ];
+          octx.moveTo(path[0][0], path[0][1]);
+          for (let i = 1; i < path.length; i++) octx.lineTo(path[i][0], path[i][1]);
+        } else {
+          const pts = ['tl', 'tr', 'br', 'bl'].map((k) => map(liveDetect.quad[k]));
+          octx.moveTo(pts[0][0], pts[0][1]);
+          for (let i = 1; i < 4; i++) octx.lineTo(pts[i][0], pts[i][1]);
+        }
         octx.closePath();
         octx.fillStyle = stable ? 'rgba(74, 222, 128, 0.10)' : 'rgba(74, 222, 128, 0.04)';
         octx.strokeStyle = color;
@@ -913,22 +1020,11 @@ function startLiveOverlay() {
         octx.stroke();
         // 모서리 점
         octx.fillStyle = color;
-        for (const [x, y] of pts) {
+        for (const k of ['tl', 'tr', 'br', 'bl']) {
+          const [x, y] = map(liveDetect.quad[k]);
           octx.beginPath();
           octx.arc(x, y, 5, 0, Math.PI * 2);
           octx.fill();
-        }
-        // 곡면이 감지되면 상·하 곡선 표시 (평탄화가 적용될 실제 경계)
-        if (liveDetect.curves && stable) {
-          octx.strokeStyle = 'rgba(244, 63, 94, 0.85)';
-          octx.lineWidth = 2;
-          for (const key of ['top', 'bottom']) {
-            const cps = liveDetect.curves[key].map(map);
-            octx.beginPath();
-            octx.moveTo(cps[0][0], cps[0][1]);
-            for (let i = 1; i < cps.length; i++) octx.lineTo(cps[i][0], cps[i][1]);
-            octx.stroke();
-          }
         }
       }
       if (hint) {
@@ -1008,8 +1104,8 @@ function findPageBlobs(canvas) {
   };
   const out = [];
   try {
-    const L = findDocQuad(halfCanvas(0, mid), 0.18);
-    const R = findDocQuad(halfCanvas(mid, W - mid), 0.18);
+    const L = findDocQuad(halfCanvas(0, mid), 0.18, false);       // 절반 캔버스는 경계 접촉이 정상
+    const R = findDocQuad(halfCanvas(mid, W - mid), 0.18, false);
     // 페이지 안쪽 변이 중앙선 근처에 닿아 있어야 진짜 펼침면 페이지
     if (L && Math.max(L.quad.tr.x, L.quad.br.x) > mid * 0.75) {
       out.push({ quad: L.quad, contour: L.contour });
@@ -1056,7 +1152,7 @@ async function addSpreadPages(blob, silent) {
         const temp = {
           blob,
           corners: { tl: up(b.quad.tl), tr: up(b.quad.tr), br: up(b.quad.br), bl: up(b.quad.bl) },
-          curves: curves ? { top: curves.top.map(up), bottom: curves.bottom.map(up) } : null,
+          curves: curves ? mapCurvePoints(curves, up) : null,
           autoChecked: true, rotation: 0, filter: 'original', bright: 0, contrast: 0,
         };
         const canvas = await processPage(temp, CAPTURE_MAX_SIDE);
