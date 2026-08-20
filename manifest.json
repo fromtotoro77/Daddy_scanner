@@ -1,0 +1,16 @@
+{
+  "name": "Daddy Scanner",
+  "short_name": "Daddy Scanner",
+  "description": "책·문서를 촬영해 보정하고 PDF로 만드는 스캐너 — daddy 시리즈",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0c0c0e",
+  "theme_color": "#0c0c0e",
+  "lang": "ko",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

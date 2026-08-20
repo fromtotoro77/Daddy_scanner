@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="theme-color" content="#0c0c0e">
+    <title>Daddy Scanner</title>
+    <link rel="manifest" href="manifest.json?v=1.0.0">
+    <link rel="icon" type="image/png" href="icons/icon-192.png">
+    <link rel="apple-touch-icon" href="icons/icon-192.png">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@700&family=Outfit:wght@700;900&display=swap">
+    <link rel="stylesheet" href="app.css?v=1.0.0">
+</head>
+<body>
+    <div id="app" class="app-main-width">
+
+        <!-- 헤더: daddy_radio 계승 (워드마크 + 모노 시계) -->
+        <header>
+            <button id="btn-back" class="btn-top hidden" aria-label="뒤로">
+                <svg viewBox="0 0 24 24"><path d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
+            </button>
+            <div class="logo">
+                <span class="logo-text">DADDY SCANNER <small class="logo-ver">v1.0.0</small></span>
+            </div>
+            <div id="header-clock" class="header-clock">--<span class="blink-colon">:</span>--</div>
+        </header>
+
+        <main id="main">
+
+            <!-- ============ 화면 1: 촬영 ============ -->
+            <section id="page-capture" class="page active">
+                <div class="cam-wrap">
+                    <video id="cam" autoplay playsinline muted></video>
+                    <canvas id="cam-overlay"></canvas>
+                    <div id="cam-msg" class="cam-msg">
+                        <div class="cam-msg-inner">
+                            <div class="loading-spinner"></div>
+                            <p>카메라 준비 중…</p>
+                        </div>
+                    </div>
+                    <div id="cv-status" class="cv-badge"><i></i><span>보정 엔진 로딩중</span></div>
+                </div>
+                <div class="capture-bar">
+                    <button id="btn-upload" class="cap-side" aria-label="사진 불러오기">
+                        <svg viewBox="0 0 24 24"><path d="M19 5v14H5V5h14m0-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-4.86 8.86-3 3.87L9 13.14 6 17h12l-3.86-5.14z"/></svg>
+                        <span>불러오기</span>
+                    </button>
+                    <button id="btn-shutter" aria-label="촬영"><i></i></button>
+                    <button id="btn-goto-gallery" class="cap-side" aria-label="페이지 보기">
+                        <div id="cap-thumb" class="cap-thumb empty">
+                            <span id="cap-count" class="cap-count hidden">0</span>
+                        </div>
+                        <span>페이지</span>
+                    </button>
+                </div>
+                <input type="file" id="file-input" accept="image/*" multiple hidden>
+            </section>
+
+            <!-- ============ 화면 2: 페이지 갤러리 ============ -->
+            <section id="page-gallery" class="page">
+                <div class="gal-head">
+                    <div class="section-header"><h2>페이지 <span id="gal-count" class="mono">0</span></h2></div>
+                    <div class="gal-head-btns">
+                        <button id="btn-select-mode" class="chip-btn">선택</button>
+                        <button id="btn-clear-all" class="chip-btn danger">새로 시작</button>
+                    </div>
+                </div>
+                <div id="gal-grid" class="gal-grid"></div>
+                <div id="gal-empty" class="empty-state hidden">
+                    아직 페이지가 없습니다.<br>촬영하거나 사진을 불러오세요.
+                </div>
+                <div class="bar-spacer"></div>
+                <!-- 일반 모드 하단 액션바 -->
+                <div id="gal-bar-normal" class="action-bar">
+                    <button id="btn-add-shot" class="bar-btn">
+                        <svg viewBox="0 0 24 24"><path d="M12 15.2a3.2 3.2 0 1 0 0-6.4 3.2 3.2 0 0 0 0 6.4zM9 3 7.17 5H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2h-3.17L15 3H9zm3 15c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5z"/></svg>
+                        촬영
+                    </button>
+                    <button id="btn-make-pdf" class="bar-btn primary">
+                        <svg viewBox="0 0 24 24"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm-1 7V3.5L18.5 9H13z"/></svg>
+                        PDF 만들기
+                    </button>
+                </div>
+                <!-- 선택 모드 하단 액션바 -->
+                <div id="gal-bar-select" class="action-bar hidden">
+                    <button id="btn-move-left" class="bar-btn icon-only" disabled aria-label="앞으로 이동">
+                        <svg viewBox="0 0 24 24"><path d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
+                    </button>
+                    <button id="btn-move-right" class="bar-btn icon-only" disabled aria-label="뒤로 이동">
+                        <svg viewBox="0 0 24 24"><path d="m8.59 16.59 1.41 1.41 6-6-6-6-1.41 1.41L13.17 12z"/></svg>
+                    </button>
+                    <button id="btn-delete-sel" class="bar-btn danger" disabled>
+                        <svg viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+                        삭제 <span id="sel-count" class="mono"></span>
+                    </button>
+                    <button id="btn-select-cancel" class="bar-btn">완료</button>
+                </div>
+            </section>
+
+            <!-- ============ 화면 3: 페이지 편집 ============ -->
+            <section id="page-edit" class="page">
+                <div class="edit-head">
+                    <button id="btn-edit-prev" class="btn-top" aria-label="이전 페이지">
+                        <svg viewBox="0 0 24 24"><path d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
+                    </button>
+                    <span id="edit-pos" class="mono edit-pos">1 / 1</span>
+                    <button id="btn-edit-next" class="btn-top" aria-label="다음 페이지">
+                        <svg viewBox="0 0 24 24"><path d="m8.59 16.59 1.41 1.41 6-6-6-6-1.41 1.41L13.17 12z"/></svg>
+                    </button>
+                </div>
+                <div class="edit-view-wrap">
+                    <canvas id="edit-canvas"></canvas>
+                    <div id="edit-loading" class="edit-loading hidden"><div class="loading-spinner"></div></div>
+                </div>
+                <div class="filter-chips" id="filter-chips">
+                    <button data-filter="magic" class="chip">매직컬러</button>
+                    <button data-filter="bw" class="chip">흑백문서</button>
+                    <button data-filter="gray" class="chip">그레이</button>
+                    <button data-filter="sharpen" class="chip">선명하게</button>
+                    <button data-filter="original" class="chip">원본</button>
+                </div>
+                <div class="sliders">
+                    <label><span>밝기</span><input type="range" id="sl-bright" min="-50" max="80" value="0"><b id="sl-bright-v" class="mono">0</b></label>
+                    <label><span>대비</span><input type="range" id="sl-contrast" min="-50" max="80" value="0"><b id="sl-contrast-v" class="mono">0</b></label>
+                </div>
+                <div class="bar-spacer"></div>
+                <div class="action-bar">
+                    <button id="btn-rotate" class="bar-btn icon-only" aria-label="회전">
+                        <svg viewBox="0 0 24 24"><path d="M15.55 5.55 11 1v3.07C7.06 4.56 4 7.92 4 12s3.05 7.44 7 7.93v-2.02c-2.84-.48-5-2.94-5-5.91s2.16-5.43 5-5.91V10l4.55-4.45zM19.93 11c-.17-1.39-.72-2.73-1.62-3.89l-1.42 1.42c.54.75.88 1.6 1.02 2.47h2.02zM13 17.9v2.02c1.39-.17 2.74-.71 3.9-1.61l-1.44-1.44c-.75.54-1.59.89-2.46 1.03zm3.89-2.42 1.42 1.41c.9-1.16 1.45-2.5 1.62-3.89h-2.02c-.14.87-.48 1.72-1.02 2.48z"/></svg>
+                    </button>
+                    <button id="btn-corners" class="bar-btn">
+                        <svg viewBox="0 0 24 24"><path d="M3 5v4h2V5h4V3H5c-1.1 0-2 .9-2 2zm2 10H3v4c0 1.1.9 2 2 2h4v-2H5v-4zm14 4h-4v2h4c1.1 0 2-.9 2-2v-4h-2v4zm0-16h-4v2h4v4h2V5c0-1.1-.9-2-2-2z"/></svg>
+                        영역보정
+                    </button>
+                    <button id="btn-apply-all" class="bar-btn">전체적용</button>
+                    <button id="btn-edit-delete" class="bar-btn danger icon-only" aria-label="이 페이지 삭제">
+                        <svg viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+                    </button>
+                </div>
+            </section>
+        </main>
+
+        <!-- ============ 수동 영역보정 모달 ============ -->
+        <div id="corner-modal" class="modal">
+            <div class="corner-box">
+                <div class="corner-title">문서 영역 조정 <span class="corner-hint">모서리를 드래그하세요</span></div>
+                <div id="corner-stage" class="corner-stage">
+                    <canvas id="corner-canvas"></canvas>
+                    <svg id="corner-lines"></svg>
+                    <div class="corner-handle" data-c="tl"></div>
+                    <div class="corner-handle" data-c="tr"></div>
+                    <div class="corner-handle" data-c="br"></div>
+                    <div class="corner-handle" data-c="bl"></div>
+                </div>
+                <div class="corner-btns">
+                    <button id="btn-corner-auto" class="chip-btn">자동감지</button>
+                    <button id="btn-corner-full" class="chip-btn">전체영역</button>
+                    <span class="flex-1"></span>
+                    <button id="btn-corner-cancel" class="chip-btn">취소</button>
+                    <button id="btn-corner-apply" class="chip-btn accent">적용</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- ============ PDF 생성 바텀시트 ============ -->
+        <div id="pdf-modal" class="modal">
+            <div class="sheet">
+                <div class="sheet-grip"></div>
+                <h3 class="sheet-title">PDF 만들기 <span id="pdf-page-info" class="mono sheet-sub"></span></h3>
+                <label class="sheet-label">파일 이름</label>
+                <input type="text" id="pdf-name" class="sheet-input" spellcheck="false">
+                <label class="sheet-label">품질</label>
+                <div class="quality-chips" id="quality-chips">
+                    <button data-q="high" class="chip">고화질</button>
+                    <button data-q="mid" class="chip active">표준</button>
+                    <button data-q="low" class="chip">저용량</button>
+                </div>
+                <div class="sheet-btns">
+                    <button id="btn-pdf-cancel" class="bar-btn">취소</button>
+                    <button id="btn-pdf-share" class="bar-btn">
+                        <svg viewBox="0 0 24 24"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92 1.61 0 2.92-1.31 2.92-2.92s-1.31-2.92-2.92-2.92z"/></svg>
+                        공유
+                    </button>
+                    <button id="btn-pdf-save" class="bar-btn primary">
+                        <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+                        저장
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- ============ 진행률 오버레이 ============ -->
+        <div id="progress-overlay" class="modal center">
+            <div class="progress-box">
+                <div class="loading-spinner big"></div>
+                <p id="progress-text">PDF 생성 중…</p>
+                <div class="progress-track"><div id="progress-fill" class="progress-fill"></div></div>
+            </div>
+        </div>
+
+        <div id="toast-container" class="toast-container"></div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jscanify@1.4.3/src/jscanify.min.js"></script>
+    <script src="app.js?v=1.0.0"></script>
+</body>
+</html>
