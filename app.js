@@ -650,24 +650,32 @@ function bcInPlace(d, bright, contrast) {
 /* ============================================================
    카메라 (요구 1 — 한 장/여러 장 연속 촬영)
    ============================================================ */
+/* 화면 방향에 맞는 카메라 치수 요청.
+   (정사각 2560×2560 이상값을 주면 가로형 모드가 "가장 가깝다"고 선택되어
+   세로 화면에서 가로 프레임이 오는 첫 실행 짤림이 발생 — 방향을 명시해서 방지) */
+function camConstraints() {
+  const portrait = window.innerHeight >= window.innerWidth;
+  return {
+    facingMode: { ideal: 'environment' },
+    width: { ideal: portrait ? 1440 : 2560 },
+    height: { ideal: portrait ? 2560 : 1440 },
+    aspectRatio: { ideal: portrait ? 3 / 4 : 4 / 3 },
+  };
+}
+
 async function startCamera(isRetry = false) {
   if (state.stream) return;
   const msg = $('cam-msg');
   msg.classList.remove('hidden');
   msg.querySelector('p').textContent = '카메라 준비 중…';
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 2560 }, height: { ideal: 2560 } },
-      audio: false,
-    });
+    const stream = await navigator.mediaDevices.getUserMedia({ video: camConstraints(), audio: false });
     state.stream = stream;
     const video = $('cam');
     video.srcObject = stream;
     await video.play().catch(() => {});
 
-    // 첫 실행 프리뷰 짤림 대응: 권한 최초 허용/배포 직후엔
-    // ① 저해상도 기본 스트림 또는 ② 화면과 어긋난 가로형 프레임이 오는 기기가 있다.
-    // 문제가 있으면 재협상하고, 그래도 안 되면 스트림을 1회 재시작한다.
+    // 저해상도/방향 불일치 스트림이면 방향 명시 치수로 재협상 → 안 되면 1회 재시작
     const track = stream.getVideoTracks()[0];
     if (track) {
       await new Promise((r) => setTimeout(r, 250)); // 설정 안정화 대기
@@ -676,11 +684,11 @@ async function startCamera(isRetry = false) {
         const lowRes = (st.width || 0) * (st.height || 0) < 1200 * 900;
         const winLandscape = window.innerWidth > window.innerHeight;
         const vidLandscape = (st.width || 0) > (st.height || 0);
-        return lowRes || vidLandscape !== winLandscape; // 방향 불일치 = 첫 실행 짤림의 실제 원인
+        return lowRes || vidLandscape !== winLandscape;
       };
       if (bad()) {
         try {
-          await track.applyConstraints({ width: { ideal: 2560 }, height: { ideal: 2560 } });
+          await track.applyConstraints(camConstraints());
           await new Promise((r) => setTimeout(r, 300));
         } catch (e) { /* 재협상 미지원 기기 */ }
         if (bad() && !isRetry) {
@@ -1887,6 +1895,34 @@ function bindEvents() {
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) stopCamera();
     else if (state.screen === 'capture') startCamera();
+  });
+
+  // 화면 회전 시 카메라를 새 방향에 맞춰 재시작 (펼침면 가로 촬영 대응)
+  let rotTimer = null;
+  window.addEventListener('resize', () => {
+    clearTimeout(rotTimer);
+    rotTimer = setTimeout(() => {
+      if (state.screen !== 'capture' || !state.stream) return;
+      const st = state.stream.getVideoTracks()[0]?.getSettings() || {};
+      const winLandscape = window.innerWidth > window.innerHeight;
+      const vidLandscape = (st.width || 0) > (st.height || 0);
+      if (vidLandscape !== winLandscape) {
+        stopCamera();
+        startCamera();
+      }
+    }, 400);
+  });
+
+  // 진단: 로고를 빠르게 두 번 탭하면 카메라 상태 표시
+  let logoTap = 0;
+  document.querySelector('.logo').addEventListener('click', () => {
+    const now = Date.now();
+    if (now - logoTap < 350) {
+      const st = state.stream?.getVideoTracks()[0]?.getSettings() || {};
+      const v = $('cam');
+      toast(`카메라 ${st.width || '?'}×${st.height || '?'} / 표시 ${v.videoWidth}×${v.videoHeight} / 화면 ${window.innerWidth}×${window.innerHeight}`, { duration: 5000 });
+    }
+    logoTap = now;
   });
 }
 
