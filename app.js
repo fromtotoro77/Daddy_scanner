@@ -1133,18 +1133,27 @@ function updateGuidePosition() {
   g.style.height = `${h * (1 - 2 * GUIDE_INSET)}px`;
 }
 
-/* 회전 후 스트림 방향이 화면과 어긋난 채 남는 기기 대응 — 주기 감시로 자가 복구 */
+/* 회전 후 스트림 방향이 화면과 어긋난 채 남는 기기 대응.
+   ⚠ 방향 전환 1회당 재시도 최대 2번 — 스트림이 끝내 가로로만 나오는 기기에서
+   무한 재시작 루프("카메라 준비 중" 반복)에 빠지지 않도록 포기하고 촬영 가능 상태 유지 */
+let _rotTries = 0;
+let _rotLastWinL = null;
 function startOrientationWatchdog() {
   setInterval(() => {
     updateGuidePosition();
     if (state.screen !== 'capture' || !state.stream || document.hidden || state._rotFixing) return;
-    const st = state.stream.getVideoTracks()[0]?.getSettings() || {};
     const winL = window.innerWidth > window.innerHeight;
+    if (winL !== _rotLastWinL) { _rotLastWinL = winL; _rotTries = 0; } // 실제 회전 시에만 카운터 리셋
+    if (_rotTries >= 2) return; // 이 방향에서는 이미 포기
+    const st = state.stream.getVideoTracks()[0]?.getSettings() || {};
     const vidL = (st.width || 0) > (st.height || 0);
     if ((st.width || 0) > 0 && vidL !== winL) {
+      _rotTries++;
       state._rotFixing = true;
       stopCamera();
-      startCamera().finally(() => setTimeout(() => { state._rotFixing = false; }, 1500));
+      setTimeout(() => {
+        startCamera().finally(() => setTimeout(() => { state._rotFixing = false; }, 1500));
+      }, 350); // 이전 트랙이 완전히 해제될 시간을 준 뒤 재시작
     }
   }, 1200);
 }
