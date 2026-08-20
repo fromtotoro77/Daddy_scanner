@@ -191,6 +191,8 @@ function scanQuads(binMat, imgArea, minRatio, maxRatio = 0.985, center = null) {
       }
       hull.delete();
     }
+    // 내각 검증: 원근으로 기울어도 문서라면 각이 직각 근처여야 함 (55°~125°)
+    if (quad && !quadAnglesOk(quad)) quad = null;
     if (quad) {
       best = quad;
       bestArea = area;
@@ -378,7 +380,6 @@ function findDocQuad(canvas, minRatio = 0.15, borderPenalty = true) {
   };
   let best = null;
   try {
-    push(colorRegionQuad(src, imgArea, minRatio), 'color'); // 색 차이 분할 — 최우선 후보
     const pm = paperMask(src);
     if (pm) { tryBase(pm); pm.delete(); }
     cv.threshold(blur, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
@@ -389,6 +390,8 @@ function findDocQuad(canvas, minRatio = 0.15, borderPenalty = true) {
     cv.Canny(blur, bin, 20, 70);
     cv.dilate(bin, bin, kernel, pt, 2);
     push(scanQuads(bin, imgArea, minRatio, 0.985, center), 'canny2');
+    // 색상거리 분할은 다른 모든 방법이 실패했을 때의 최후 폴백으로만
+    if (!cands.length) push(colorRegionQuad(src, imgArea, minRatio), 'color');
 
     if (cands.length) {
       // 그라디언트 맵으로 "실제 경계 위에 놓인 사각형"인지 검증
@@ -659,6 +662,20 @@ async function detectCorners(page) {
   } catch (e) {
     console.warn('detectCorners 실패', e);
   }
+}
+
+/* 문서 후보의 내각이 직각에 근사한지 (원근 기울기 감안해 55°~125° 허용) */
+function quadAnglesOk(q) {
+  const pts = [q.tl, q.tr, q.br, q.bl];
+  for (let i = 0; i < 4; i++) {
+    const p = pts[(i + 3) % 4], c = pts[i], n = pts[(i + 1) % 4];
+    const v1x = p.x - c.x, v1y = p.y - c.y, v2x = n.x - c.x, v2y = n.y - c.y;
+    const dot = v1x * v2x + v1y * v2y;
+    const m = Math.hypot(v1x, v1y) * Math.hypot(v2x, v2y) || 1;
+    const ang = (Math.acos(Math.max(-1, Math.min(1, dot / m))) * 180) / Math.PI;
+    if (ang < 55 || ang > 125) return false;
+  }
+  return true;
 }
 
 function quadArea(c) {
