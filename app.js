@@ -198,6 +198,7 @@ function findDocQuad(canvas, minRatio = 0.15) {
     // 1차: 밝은 종이 영역(페이지 전체) 우선 — 페이지 안의 표·글자 블록에 낚이지 않도록.
     // 표/글자는 종이 안쪽 내용이라 밝은 영역의 바깥 윤곽에 영향을 주지 않는다.
     cv.threshold(blur, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+    healHorizontalBands(bin); // 스프링 제본 등 어두운 가로 띠가 페이지를 상/하로 가르는 것 방지
     cv.morphologyEx(bin, bin, cv.MORPH_CLOSE, kernel, new cv.Point(-1, -1), 2);
     cv.erode(bin, bin, kernel, new cv.Point(-1, -1), 1); // 옆 페이지와의 얇은 연결 절단
     best = scanQuads(bin, imgArea, minRatio, 0.97);
@@ -718,6 +719,63 @@ function startLiveOverlay() {
       work.width = Math.round(vw * s); work.height = Math.round(vh * s);
       work.getContext('2d').drawImage(video, 0, 0, work.width, work.height);
 
+      // 펼침면 모드: 좌/우 페이지를 각각 표시 + 가운데 책등 경계를 빨간 선으로
+      if (state.spreadMode) {
+        const blobs = findPageBlobs(work);
+        const cw = overlay.clientWidth, ch = overlay.clientHeight;
+        overlay.width = cw; overlay.height = ch;
+        const octx = overlay.getContext('2d');
+        octx.clearRect(0, 0, cw, ch);
+        const fit = Math.min(cw / vw, ch / vh);
+        const ox = (cw - vw * fit) / 2, oy = (ch - vh * fit) / 2;
+        const map = (p) => [(p.x / s) * fit + ox, (p.y / s) * fit + oy];
+        const two = blobs.length === 2;
+        const color = two ? 'rgba(74, 222, 128, 0.95)' : 'rgba(74, 222, 128, 0.45)';
+        for (const b of blobs) {
+          const pts = ['tl', 'tr', 'br', 'bl'].map((k) => map(b.quad[k]));
+          octx.beginPath();
+          octx.moveTo(pts[0][0], pts[0][1]);
+          for (let i = 1; i < 4; i++) octx.lineTo(pts[i][0], pts[i][1]);
+          octx.closePath();
+          octx.fillStyle = two ? 'rgba(74, 222, 128, 0.08)' : 'rgba(74, 222, 128, 0.04)';
+          octx.strokeStyle = color;
+          octx.lineWidth = 2.5;
+          octx.fill();
+          octx.stroke();
+        }
+        // 책등(분할) 경계선 — 빨간색
+        let spineTop = null, spineBot = null;
+        if (two) {
+          const [L, R] = blobs;
+          spineTop = map({ x: (L.quad.tr.x + R.quad.tl.x) / 2, y: (L.quad.tr.y + R.quad.tl.y) / 2 });
+          spineBot = map({ x: (L.quad.br.x + R.quad.bl.x) / 2, y: (L.quad.br.y + R.quad.bl.y) / 2 });
+        } else if (blobs.length === 1) {
+          const q = blobs[0].quad;
+          spineTop = map({ x: (q.tl.x + q.tr.x) / 2, y: (q.tl.y + q.tr.y) / 2 });
+          spineBot = map({ x: (q.bl.x + q.br.x) / 2, y: (q.bl.y + q.br.y) / 2 });
+        }
+        if (spineTop) {
+          octx.beginPath();
+          octx.moveTo(spineTop[0], spineTop[1]);
+          octx.lineTo(spineBot[0], spineBot[1]);
+          octx.strokeStyle = 'rgba(244, 63, 94, 0.95)';
+          octx.lineWidth = 3;
+          octx.setLineDash([10, 7]);
+          octx.stroke();
+          octx.setLineDash([]);
+        }
+        if (hint) {
+          if (two) {
+            hint.textContent = '펼침면 인식됨 — 촬영하면 2페이지로 분할';
+            hint.className = 'detect-hint ok';
+          } else {
+            hint.textContent = blobs.length ? '펼침면 인식 중…' : '펼친 책을 화면에 맞춰 주세요';
+            hint.className = 'detect-hint';
+          }
+        }
+        return;
+      }
+
       const foundRes = findDocQuad(work, 0.15);
       const found = foundRes ? foundRes.quad : null;
       liveDetect.curves = foundRes ? extractCurves(foundRes.contour, foundRes.quad) : null;
@@ -834,6 +892,15 @@ async function addCapturedBlob(blob, silent) {
   await addPage(blob, silent);
 }
 
+/* 세로 커널 닫기: 어두운 "가로 띠"(스프링 제본·자·그림자)로 갈라진 밝은 영역을 위아래로 이어붙임.
+   세로 방향으로만 메꾸므로 펼침면의 세로 책등(좌/우 분리)은 유지된다 */
+function healHorizontalBands(bin) {
+  const h = Math.max(15, Math.round(bin.rows * 0.055)) | 1;
+  const vk = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(1, h));
+  cv.morphologyEx(bin, bin, cv.MORPH_CLOSE, vk, new cv.Point(-1, -1), 1);
+  vk.delete();
+}
+
 /* 펼침면에서 좌/우 페이지 블롭을 각각 감지 (책등 그림자가 두 밝은 영역을 가르는 것을 이용) */
 function findPageBlobs(canvas) {
   const src = cv.imread(canvas);
@@ -847,6 +914,7 @@ function findPageBlobs(canvas) {
   const found = [];
   try {
     cv.threshold(blur, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+    healHorizontalBands(bin); // 페이지를 상/하로 가르는 가로 띠 메꿈 (세로 책등 분리는 유지)
     cv.morphologyEx(bin, bin, cv.MORPH_CLOSE, kernel, new cv.Point(-1, -1), 2);
     cv.erode(bin, bin, kernel, new cv.Point(-1, -1), 1);
     const contours = new cv.MatVector();
@@ -905,6 +973,14 @@ async function addSpreadPages(blob, silent) {
     const blobs = findPageBlobs(dc);
     const up = (p) => ({ x: p.x / scale, y: p.y / scale });
 
+    // 두 블롭이 "좌우로 나란"할 때만 펼침면 두 페이지로 인정.
+    // (스프링 제본·그림자 같은 어두운 가로 띠가 한 페이지를 위/아래로 가른 경우 오인 방지)
+    if (blobs.length === 2) {
+      const cen = (q) => ({ x: (q.tl.x + q.tr.x + q.br.x + q.bl.x) / 4, y: (q.tl.y + q.tr.y + q.br.y + q.bl.y) / 4 });
+      const c1 = cen(blobs[0].quad), c2 = cen(blobs[1].quad);
+      if (Math.abs(c1.x - c2.x) < Math.abs(c1.y - c2.y) * 1.2) blobs.length = 1;
+    }
+
     if (blobs.length === 2) {
       // 이상적 경로: 페이지별로 각각 보정 → 곡면도 페이지 단위로 정확히 펴짐
       for (const b of blobs) {
@@ -932,6 +1008,13 @@ async function addSpreadPages(blob, silent) {
     if (!temp.corners) return false;
     const canvas = await processPage(temp, CAPTURE_MAX_SIDE);
     if (canvas.width < 200) return false;
+    // 보정 결과가 세로형이면 펼침면이 아니라 한 페이지 → 자르지 않고 그대로 저장
+    if (canvas.width < canvas.height * 1.15) {
+      const single = await new Promise((res) => canvas.toBlob(res, 'image/jpeg', 0.92));
+      await addPage(single, true, true);
+      if (!silent) toast('펼침면으로 보이지 않아 한 페이지로 저장됨', { duration: 1800 });
+      return true;
+    }
     const sx = findSpineX(canvas);
     const cut = (x0, w) => {
       const c = document.createElement('canvas');
@@ -1768,8 +1851,26 @@ function dismissSplash() {
   }, delay);
 }
 
+/* 폰 뒤로가기 버튼 → 앱 종료 대신 화면 이동 (History 가드 패턴) */
+function initBackNavigation() {
+  try {
+    history.replaceState({ app: 1 }, '');
+    history.pushState({ guard: 1 }, '');
+  } catch (e) { return; }
+  const reguard = () => history.pushState({ guard: 1 }, '');
+  window.addEventListener('popstate', () => {
+    if ($('corner-modal').classList.contains('open')) { closeCornerModal(); reguard(); return; }
+    if ($('pdf-modal').classList.contains('open')) { closePdfModal(); reguard(); return; }
+    if ($('progress-overlay').classList.contains('open')) { reguard(); return; } // PDF 생성 중엔 무시
+    if (state.screen === 'edit') { show('gallery'); reguard(); return; }
+    if (state.screen === 'gallery') { show('capture'); reguard(); return; }
+    history.back(); // 촬영 화면에서 한 번 더 누르면 실제 종료
+  });
+}
+
 async function init() {
   dismissSplash();
+  initBackNavigation();
   bindEvents();
   await restoreSession();
   show('capture');
