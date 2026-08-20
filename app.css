@@ -149,7 +149,9 @@ main {
   inset: 0;
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  /* contain: 카메라 전체 프레임을 그대로 보여줌 → 미리보기 = 실제 촬영 범위 (잘림 없음) */
+  object-fit: contain;
+  background: #000;
 }
 
 #cam-overlay {

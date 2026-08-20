@@ -553,10 +553,10 @@ function startLiveOverlay() {
 
       const stable = liveDetect.quad && liveDetect.hitStreak >= 2;
       if (liveDetect.quad) {
-        // object-fit: cover 좌표 변환
-        const cover = Math.max(cw / vw, ch / vh);
-        const ox = (cw - vw * cover) / 2, oy = (ch - vh * cover) / 2;
-        const map = (p) => [(p.x / s) * cover + ox, (p.y / s) * cover + oy];
+        // object-fit: contain 좌표 변환 (미리보기 = 전체 프레임)
+        const fit = Math.min(cw / vw, ch / vh);
+        const ox = (cw - vw * fit) / 2, oy = (ch - vh * fit) / 2;
+        const map = (p) => [(p.x / s) * fit + ox, (p.y / s) * fit + oy];
         const pts = ['tl', 'tr', 'br', 'bl'].map((k) => map(liveDetect.quad[k]));
         const color = stable ? 'rgba(74, 222, 128, 0.95)' : 'rgba(74, 222, 128, 0.45)';
         octx.beginPath();
