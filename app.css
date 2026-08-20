@@ -345,6 +345,36 @@ main {
   box-shadow: 0 0 8px rgba(244, 63, 94, 0.6);
 }
 
+/* 펼침면 분할 토글 */
+.spread-toggle {
+  position: absolute;
+  top: 0.8rem;
+  right: 0.8rem;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  padding: 6px 12px;
+  border-radius: 999px;
+  color: var(--text-dim);
+  background: rgba(12, 12, 14, 0.55);
+  backdrop-filter: blur(6px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.spread-toggle svg { width: 14px; height: 14px; fill: currentColor; }
+.spread-toggle:active { transform: scale(0.95); }
+.spread-toggle.on {
+  color: #0c0c0e;
+  background: var(--brand-primary);
+  border-color: transparent;
+  box-shadow: 0 0 14px rgba(255, 255, 255, 0.2);
+}
+
 /* 실시간 감지 상태 안내 */
 .detect-hint {
   position: absolute;

@@ -27,6 +27,7 @@ const state = {
   scanner: null,
   stream: null,
   pdfQuality: 'mid',
+  spreadMode: localStorage.getItem('spreadMode') === '1', // 펼침면 좌/우 분할
 };
 
 /* ============================================================
@@ -86,7 +87,11 @@ const idb = {
   },
 };
 
-function persistPage(page) { idb.put(page, state.pages.indexOf(page)); }
+function persistPage(page) {
+  const i = state.pages.indexOf(page);
+  if (i < 0) return; // 분할용 임시 페이지 등 목록 밖 객체는 저장하지 않음
+  idb.put(page, i);
+}
 function persistOrder() { state.pages.forEach((p, i) => idb.put(p, i)); }
 
 /* ============================================================
@@ -644,7 +649,7 @@ function bcInPlace(d, bright, contrast) {
 /* ============================================================
    카메라 (요구 1 — 한 장/여러 장 연속 촬영)
    ============================================================ */
-async function startCamera() {
+async function startCamera(isRetry = false) {
   if (state.stream) return;
   const msg = $('cam-msg');
   msg.classList.remove('hidden');
@@ -658,6 +663,26 @@ async function startCamera() {
     const video = $('cam');
     video.srcObject = stream;
     await video.play().catch(() => {});
+
+    // 권한 최초 허용 직후엔 저해상도 기본 스트림이 오는 기기가 있음(첫 실행 프리뷰 짤림).
+    // 해상도를 확인해 낮으면 재협상하고, 그래도 낮으면 스트림을 1회 재시작한다.
+    const track = stream.getVideoTracks()[0];
+    if (track) {
+      await new Promise((r) => setTimeout(r, 250)); // 설정 안정화 대기
+      let st = track.getSettings();
+      if ((st.width || 0) * (st.height || 0) < 1200 * 900) {
+        try {
+          await track.applyConstraints({ width: { ideal: 2560 }, height: { ideal: 2560 } });
+          await new Promise((r) => setTimeout(r, 250));
+          st = track.getSettings();
+        } catch (e) { /* 재협상 미지원 기기 */ }
+        if ((st.width || 0) * (st.height || 0) < 1200 * 900 && !isRetry) {
+          stopCamera();
+          return startCamera(true);
+        }
+      }
+    }
+
     msg.classList.add('hidden');
     $('btn-shutter').disabled = false;
   } catch (e) {
@@ -792,17 +817,191 @@ async function capture() {
   c.height = Math.round(video.videoHeight * scale);
   c.getContext('2d').drawImage(video, 0, 0, c.width, c.height);
   const blob = await new Promise((res) => c.toBlob(res, 'image/jpeg', 0.92));
-  await addPage(blob);
+  await addCapturedBlob(blob, false);
 }
 
-/* 페이지 추가 (촬영/불러오기 공용) */
-async function addPage(blob, silent = false) {
+/* 촬영/불러오기 공통 진입점 — 펼침면 모드면 좌/우 분할 시도 */
+async function addCapturedBlob(blob, silent) {
+  if (state.spreadMode) {
+    if (!state.cvReady) {
+      if (!silent) toast('보정 엔진 로딩 후 분할 가능 — 한 장으로 저장됨', { type: 'error' });
+    } else if (await addSpreadPages(blob, silent)) {
+      return;
+    } else if (!silent) {
+      toast('페이지 감지 실패 — 한 장으로 저장됨', { type: 'error' });
+    }
+  }
+  await addPage(blob, silent);
+}
+
+/* 펼침면에서 좌/우 페이지 블롭을 각각 감지 (책등 그림자가 두 밝은 영역을 가르는 것을 이용) */
+function findPageBlobs(canvas) {
+  const src = cv.imread(canvas);
+  const imgArea = src.cols * src.rows;
+  const gray = new cv.Mat();
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+  const blur = new cv.Mat();
+  cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
+  const bin = new cv.Mat();
+  const kernel = cv.Mat.ones(3, 3, cv.CV_8U);
+  const found = [];
+  try {
+    cv.threshold(blur, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+    cv.morphologyEx(bin, bin, cv.MORPH_CLOSE, kernel, new cv.Point(-1, -1), 2);
+    cv.erode(bin, bin, kernel, new cv.Point(-1, -1), 1);
+    const contours = new cv.MatVector();
+    const hier = new cv.Mat();
+    cv.findContours(bin, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    for (let i = 0; i < contours.size(); i++) {
+      const cnt = contours.get(i);
+      const area = cv.contourArea(cnt);
+      if (area < imgArea * 0.1 || area > imgArea * 0.85) { cnt.delete(); continue; }
+      const peri = cv.arcLength(cnt, true);
+      let quad = null;
+      for (const k of [0.02, 0.035, 0.05, 0.08]) {
+        const approx = new cv.Mat();
+        if (quad === null) {
+          cv.approxPolyDP(cnt, approx, k * peri, true);
+          if (approx.rows === 4 && cv.isContourConvex(approx)) {
+            const pts = [];
+            for (let j = 0; j < 4; j++) pts.push({ x: approx.data32S[j * 2], y: approx.data32S[j * 2 + 1] });
+            quad = orderQuad(pts);
+          }
+        }
+        approx.delete();
+      }
+      if (quad) {
+        const contour = [];
+        const d = cnt.data32S;
+        for (let j = 0; j < d.length; j += 2) contour.push({ x: d[j], y: d[j + 1] });
+        found.push({ quad, contour, area });
+      }
+      cnt.delete();
+    }
+    contours.delete();
+    hier.delete();
+  } catch (e) {
+    console.warn('findPageBlobs 실패', e);
+  }
+  src.delete(); gray.delete(); blur.delete(); bin.delete(); kernel.delete();
+  found.sort((a, b) => b.area - a.area);
+  // 두 번째 블롭이 첫 번째의 40% 이상일 때만 "두 페이지"로 인정
+  const top = found.slice(0, 2).filter((b, i) => i === 0 || b.area >= found[0].area * 0.4);
+  top.sort((a, b) => (a.quad.tl.x + a.quad.br.x) - (b.quad.tl.x + b.quad.br.x)); // 왼쪽 → 오른쪽
+  return top;
+}
+
+/* 펼침면 분할: 좌/우 페이지를 각각 보정(원근+곡면)해 2페이지로 저장 */
+async function addSpreadPages(blob, silent) {
+  try {
+    const bmp = await createImageBitmap(blob);
+    const scale = Math.min(1, 1000 / Math.max(bmp.width, bmp.height));
+    const dc = document.createElement('canvas');
+    dc.width = Math.round(bmp.width * scale);
+    dc.height = Math.round(bmp.height * scale);
+    dc.getContext('2d').drawImage(bmp, 0, 0, dc.width, dc.height);
+    bmp.close();
+
+    const blobs = findPageBlobs(dc);
+    const up = (p) => ({ x: p.x / scale, y: p.y / scale });
+
+    if (blobs.length === 2) {
+      // 이상적 경로: 페이지별로 각각 보정 → 곡면도 페이지 단위로 정확히 펴짐
+      for (const b of blobs) {
+        const curves = extractCurves(b.contour, b.quad);
+        const temp = {
+          blob,
+          corners: { tl: up(b.quad.tl), tr: up(b.quad.tr), br: up(b.quad.br), bl: up(b.quad.bl) },
+          curves: curves ? { top: curves.top.map(up), bottom: curves.bottom.map(up) } : null,
+          autoChecked: true, rotation: 0, filter: 'original', bright: 0, contrast: 0,
+        };
+        const canvas = await processPage(temp, CAPTURE_MAX_SIDE);
+        const pageBlob = await new Promise((res) => canvas.toBlob(res, 'image/jpeg', 0.92));
+        await addPage(pageBlob, true, true);
+      }
+      if (!silent) toast(`펼침면 분할 → ${state.pages.length - 1}·${state.pages.length}페이지`, { type: 'success', duration: 1600 });
+      return true;
+    }
+
+    // 폴백: 펼침면이 한 덩어리로 잡히면 통째 보정 후 책등 골짜기에서 절단
+    const temp = {
+      blob, corners: null, curves: null, autoChecked: false,
+      rotation: 0, filter: 'original', bright: 0, contrast: 0,
+    };
+    await detectCorners(temp);
+    if (!temp.corners) return false;
+    const canvas = await processPage(temp, CAPTURE_MAX_SIDE);
+    if (canvas.width < 200) return false;
+    const sx = findSpineX(canvas);
+    const cut = (x0, w) => {
+      const c = document.createElement('canvas');
+      c.width = w;
+      c.height = canvas.height;
+      c.getContext('2d').drawImage(canvas, x0, 0, w, canvas.height, 0, 0, w, canvas.height);
+      return new Promise((res) => c.toBlob(res, 'image/jpeg', 0.92));
+    };
+    const leftBlob = await cut(0, sx);
+    const rightBlob = await cut(sx, canvas.width - sx);
+    await addPage(leftBlob, true, true);
+    await addPage(rightBlob, true, true);
+    if (!silent) toast(`펼침면 분할 → ${state.pages.length - 1}·${state.pages.length}페이지`, { type: 'success', duration: 1600 });
+    return true;
+  } catch (e) {
+    console.warn('펼침면 분할 실패', e);
+    return false;
+  }
+}
+
+/* 책등(골짜기) 위치: 중앙 30% 구간에서 가장 어두운 세로줄. 뚜렷하지 않으면 중앙 */
+function findSpineX(canvas) {
+  const W = 400;
+  const scale = W / canvas.width;
+  const H = Math.max(8, Math.round(canvas.height * scale));
+  const c = document.createElement('canvas');
+  c.width = W;
+  c.height = H;
+  const ctx = c.getContext('2d');
+  ctx.drawImage(canvas, 0, 0, W, H);
+  const d = ctx.getImageData(0, Math.round(H * 0.2), W, Math.max(1, Math.round(H * 0.6))).data;
+  const rows = Math.max(1, Math.round(H * 0.6));
+  const col = new Float32Array(W);
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = (y * W + x) * 4;
+      col[x] += d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114;
+    }
+  }
+  for (let x = 0; x < W; x++) col[x] /= rows;
+  // 5px 이동평균 후 중앙 35~65% 구간에서 최솟값 탐색
+  const sm = new Float32Array(W);
+  for (let x = 0; x < W; x++) {
+    let s = 0, n = 0;
+    for (let k = -2; k <= 2; k++) {
+      const xx = x + k;
+      if (xx >= 0 && xx < W) { s += col[xx]; n++; }
+    }
+    sm[x] = s / n;
+  }
+  const lo = Math.round(W * 0.35), hi = Math.round(W * 0.65);
+  let minX = Math.round(W / 2), minV = Infinity;
+  for (let x = lo; x <= hi; x++) {
+    if (sm[x] < minV) { minV = sm[x]; minX = x; }
+  }
+  const sorted = [...sm].sort((a, b) => a - b);
+  const median = sorted[W >> 1];
+  // 골짜기가 주변보다 확실히 어두울 때만 채택, 아니면 정중앙
+  const spine = minV < median - 8 ? minX : Math.round(W / 2);
+  return Math.round(spine / scale);
+}
+
+/* 페이지 추가 (촬영/불러오기 공용). preprocessed=true면 이미 보정된 이미지라 감지 생략 */
+async function addPage(blob, silent = false, preprocessed = false) {
   const page = {
     id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random(),
     blob,
     corners: null,
     curves: null,
-    autoChecked: false,
+    autoChecked: preprocessed,
     rotation: 0,
     filter: 'magic',
     bright: 0,
@@ -814,9 +1013,11 @@ async function addPage(blob, silent = false) {
   persistPage(page);
   updateCaptureBadge();
   if (!silent) toast(`${state.pages.length}페이지 추가됨`, { type: 'success', duration: 1400 });
-  detectCorners(page).then(() => {
-    if (state.screen === 'gallery') renderGallery();
-  });
+  if (!preprocessed) {
+    detectCorners(page).then(() => {
+      if (state.screen === 'gallery') renderGallery();
+    });
+  }
   return page;
 }
 
@@ -858,7 +1059,7 @@ async function importFiles(files) {
         blob = await new Promise((res) => c.toBlob(res, 'image/jpeg', 0.92));
       }
       bmp.close();
-      await addPage(blob, true);
+      await addCapturedBlob(blob, true);
     } catch (e) {
       console.warn('불러오기 실패', e);
     }
@@ -1457,6 +1658,15 @@ function bindEvents() {
 
   // 촬영
   $('btn-shutter').onclick = capture;
+  $('btn-spread').classList.toggle('on', state.spreadMode);
+  $('btn-spread').onclick = () => {
+    state.spreadMode = !state.spreadMode;
+    localStorage.setItem('spreadMode', state.spreadMode ? '1' : '0');
+    $('btn-spread').classList.toggle('on', state.spreadMode);
+    toast(state.spreadMode
+      ? '펼침면 모드 ON — 촬영하면 좌/우 페이지로 나눠 저장됩니다'
+      : '펼침면 모드 해제', { duration: 2000 });
+  };
   $('btn-upload').onclick = () => $('file-input').click();
   $('file-input').onchange = (e) => { importFiles(e.target.files); e.target.value = ''; };
   $('btn-goto-gallery').onclick = () => show('gallery');
