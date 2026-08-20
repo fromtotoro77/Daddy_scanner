@@ -71,8 +71,8 @@ const idb = {
   tx(mode) { return this.db.transaction('pages', mode).objectStore('pages'); },
   put(page, order) {
     if (!this.db) return;
-    const { id, blob, corners, autoChecked, rotation, filter, bright, contrast } = page;
-    this.tx('readwrite').put({ id, blob, corners, autoChecked, rotation, filter, bright, contrast, order });
+    const { id, blob, corners, curves, autoChecked, rotation, filter, bright, contrast } = page;
+    this.tx('readwrite').put({ id, blob, corners, curves: curves || null, autoChecked, rotation, filter, bright, contrast, order });
   },
   delete(id) { if (this.db) this.tx('readwrite').delete(id); },
   clear() { if (this.db) this.tx('readwrite').clear(); },
@@ -138,9 +138,9 @@ function orderQuad(pts) {
   return { tl: bySum[0], br: bySum[3], bl: byDiff[0], tr: byDiff[3] };
 }
 
-/* 이진 엣지 맵에서 가장 큰 볼록 사각형을 찾는다 */
+/* 이진 엣지 맵에서 가장 큰 볼록 사각형을 찾는다 (원시 윤곽선도 함께 반환 — 곡면 추출용) */
 function scanQuads(binMat, imgArea, minRatio) {
-  let best = null, bestArea = 0;
+  let best = null, bestArea = 0, bestContour = null;
   const contours = new cv.MatVector();
   const hier = new cv.Mat();
   cv.findContours(binMat, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
@@ -156,13 +156,16 @@ function scanQuads(binMat, imgArea, minRatio) {
       for (let j = 0; j < 4; j++) pts.push({ x: approx.data32S[j * 2], y: approx.data32S[j * 2 + 1] });
       best = orderQuad(pts);
       bestArea = area;
+      bestContour = [];
+      const d = cnt.data32S;
+      for (let j = 0; j < d.length; j += 2) bestContour.push({ x: d[j], y: d[j + 1] });
     }
     approx.delete();
     cnt.delete();
   }
   contours.delete();
   hier.delete();
-  return best;
+  return best ? { quad: best, contour: bestContour } : null;
 }
 
 /* 캔버스에서 문서 사각형 감지 → {tl,tr,br,bl} (캔버스 좌표) 또는 null */
@@ -201,6 +204,154 @@ function findDocQuad(canvas, minRatio = 0.15) {
   return best;
 }
 
+/* ============================================================
+   곡면 평탄화 — 곡선 경계 메시 워프
+   상·하 테두리를 곡선(폴리라인)으로 추출해 격자 리맵으로 편다
+   ============================================================ */
+const CURVE_SAMPLES = 17; // 곡선 샘플 점 개수
+
+function segDist(p, a, b) {
+  const vx = b.x - a.x, vy = b.y - a.y;
+  const len2 = vx * vx + vy * vy || 1;
+  let t = ((p.x - a.x) * vx + (p.y - a.y) * vy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(p.x - (a.x + t * vx), p.y - (a.y + t * vy));
+}
+
+/* 윤곽선에서 A→B 변에 속한 점들로 곡선을 피팅 (구간별 중앙값 + 평활, 끝점은 모서리 고정) */
+function fitEdgeCurve(contour, A, B, quad) {
+  const ex = B.x - A.x, ey = B.y - A.y;
+  const L = Math.hypot(ex, ey);
+  if (L < 10) return null;
+  const ux = ex / L, uy = ey / L;
+  const nx = -uy, ny = ux; // 법선
+  const edges = [[quad.tl, quad.tr], [quad.tr, quad.br], [quad.br, quad.bl], [quad.bl, quad.tl]];
+
+  const K = CURVE_SAMPLES - 1;
+  const bins = Array.from({ length: K + 1 }, () => []);
+  for (const p of contour) {
+    // 이 변에 가장 가까운 점만 채택 (모서리 부근 타 변 점 오염 방지)
+    const dHere = segDist(p, A, B);
+    let nearest = true;
+    for (const [a, b] of edges) {
+      if ((a === A && b === B) || (a === B && b === A)) continue;
+      if (segDist(p, a, b) < dHere) { nearest = false; break; }
+    }
+    if (!nearest) continue;
+    const t = ((p.x - A.x) * ux + (p.y - A.y) * uy) / L;
+    if (t < -0.02 || t > 1.02) continue;
+    const d = (p.x - A.x) * nx + (p.y - A.y) * ny; // 부호 있는 수직 편차
+    const bi = Math.max(0, Math.min(K, Math.round(t * K)));
+    bins[bi].push(d);
+  }
+
+  const dev = new Array(K + 1).fill(null);
+  let filled = 0;
+  for (let i = 0; i <= K; i++) {
+    if (bins[i].length) {
+      bins[i].sort((a, b) => a - b);
+      dev[i] = bins[i][bins[i].length >> 1]; // 중앙값 (이상치 강건)
+      filled++;
+    }
+  }
+  if (filled < 6) return null;
+  dev[0] = 0; dev[K] = 0; // 끝점은 모서리에 고정
+  // 빈 구간 선형 보간
+  for (let i = 1; i < K; i++) {
+    if (dev[i] !== null) continue;
+    let j = i + 1;
+    while (dev[j] === null) j++;
+    const prev = dev[i - 1];
+    for (let k = i; k < j; k++) dev[k] = prev + ((dev[j] - prev) * (k - i + 1)) / (j - i + 1);
+  }
+  // 3점 이동평균 평활
+  const sm = dev.slice();
+  for (let i = 1; i < K; i++) sm[i] = (dev[i - 1] + dev[i] + dev[i + 1]) / 3;
+
+  // 휨이 미미하면 직선 취급 (불필요한 리맵 방지)
+  const maxDev = Math.max(...sm.map(Math.abs));
+  if (maxDev < Math.max(2.5, L * 0.012)) return null;
+
+  return sm.map((d, i) => {
+    const t = i / K;
+    return { x: A.x + t * ex + d * nx, y: A.y + t * ey + d * ny };
+  });
+}
+
+function sampleLine(A, B, n) {
+  return Array.from({ length: n }, (_, i) => {
+    const t = i / (n - 1);
+    return { x: A.x + (B.x - A.x) * t, y: A.y + (B.y - A.y) * t };
+  });
+}
+
+/* 윤곽선 + 사각형 → 상·하 곡선 (휨이 없으면 null) */
+function extractCurves(contour, quad) {
+  if (!contour || contour.length < 12) return null;
+  const top = fitEdgeCurve(contour, quad.tl, quad.tr, quad);
+  const bottom = fitEdgeCurve(contour, quad.bl, quad.br, quad);
+  if (!top && !bottom) return null;
+  return {
+    top: top || sampleLine(quad.tl, quad.tr, CURVE_SAMPLES),
+    bottom: bottom || sampleLine(quad.bl, quad.br, CURVE_SAMPLES),
+  };
+}
+
+function polylineLen(pts) {
+  let l = 0;
+  for (let i = 1; i < pts.length; i++) l += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+  return l;
+}
+
+/* 폴리라인을 호길이 기준 n개 점으로 리샘플 */
+function resamplePolyline(pts, n) {
+  const cum = [0];
+  for (let i = 1; i < pts.length; i++) {
+    cum.push(cum[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y));
+  }
+  const total = cum[cum.length - 1] || 1;
+  const out = new Array(n);
+  let seg = 0;
+  for (let i = 0; i < n; i++) {
+    const target = (i / (n - 1)) * total;
+    while (seg < pts.length - 2 && cum[seg + 1] < target) seg++;
+    const span = cum[seg + 1] - cum[seg] || 1;
+    const t = (target - cum[seg]) / span;
+    out[i] = {
+      x: pts[seg].x + (pts[seg + 1].x - pts[seg].x) * t,
+      y: pts[seg].y + (pts[seg + 1].y - pts[seg].y) * t,
+    };
+  }
+  return out;
+}
+
+/* 곡선 경계 메시 리맵 — 촬영 순간 곡면까지 평탄화 */
+function warpCurved(canvas, quad, curves) {
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  const W = Math.max(24, Math.min(canvas.width * 2, Math.round(Math.max(polylineLen(curves.top), polylineLen(curves.bottom)))));
+  const H = Math.max(24, Math.min(canvas.height * 2, Math.round(Math.max(dist(quad.tl, quad.bl), dist(quad.tr, quad.br)))));
+  const top = resamplePolyline(curves.top, W);
+  const bot = resamplePolyline(curves.bottom, W);
+  const mapX = new cv.Mat(H, W, cv.CV_32FC1);
+  const mapY = new cv.Mat(H, W, cv.CV_32FC1);
+  const mx = mapX.data32F, my = mapY.data32F;
+  for (let y = 0; y < H; y++) {
+    const s = y / (H - 1);
+    const row = y * W;
+    for (let x = 0; x < W; x++) {
+      mx[row + x] = top[x].x + s * (bot[x].x - top[x].x);
+      my[row + x] = top[x].y + s * (bot[x].y - top[x].y);
+    }
+  }
+  const src = cv.imread(canvas);
+  const dst = new cv.Mat();
+  cv.remap(src, dst, mapX, mapY, cv.INTER_LINEAR, cv.BORDER_REPLICATE);
+  const out = document.createElement('canvas');
+  cv.imshow(out, dst);
+  src.delete(); dst.delete(); mapX.delete(); mapY.delete();
+  return out;
+}
+
 async function detectCorners(page) {
   page.autoChecked = true;
   if (!state.cvReady) return;
@@ -213,9 +364,11 @@ async function detectCorners(page) {
     c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
     bmp.close();
 
-    let corners = findDocQuad(c, 0.15);
+    const found = findDocQuad(c, 0.15);
+    let corners = found ? found.quad : null;
+    let curves = found ? extractCurves(found.contour, found.quad) : null;
 
-    // 최후 폴백: jscanify 기본 감지
+    // 최후 폴백: jscanify 기본 감지 (곡선 없음)
     if (!corners) {
       const img = cv.imread(c);
       const contour = state.scanner.findPaperContour(img);
@@ -234,12 +387,9 @@ async function detectCorners(page) {
     }
 
     if (corners) {
-      page.corners = {
-        tl: { x: corners.tl.x / scale, y: corners.tl.y / scale },
-        tr: { x: corners.tr.x / scale, y: corners.tr.y / scale },
-        br: { x: corners.br.x / scale, y: corners.br.y / scale },
-        bl: { x: corners.bl.x / scale, y: corners.bl.y / scale },
-      };
+      const up = (p) => ({ x: p.x / scale, y: p.y / scale }); // 감지 좌표 → 원본 좌표
+      page.corners = { tl: up(corners.tl), tr: up(corners.tr), br: up(corners.br), bl: up(corners.bl) };
+      page.curves = curves ? { top: curves.top.map(up), bottom: curves.bottom.map(up) } : null;
       page.thumbDirty = true;
     }
     persistPage(page);
@@ -279,15 +429,21 @@ async function processPage(page, maxSide) {
     src.getContext('2d').drawImage(bmp, 0, 0, src.width, src.height);
     bmp.close();
 
-    // 1) 원근 보정
+    // 1) 원근 보정 (+ 곡면 평탄화)
     if (page.corners && state.cvReady) {
-      const sc = { // 원본 좌표 → 다운스케일 좌표
-        tl: { x: page.corners.tl.x * preScale, y: page.corners.tl.y * preScale },
-        tr: { x: page.corners.tr.x * preScale, y: page.corners.tr.y * preScale },
-        br: { x: page.corners.br.x * preScale, y: page.corners.br.y * preScale },
-        bl: { x: page.corners.bl.x * preScale, y: page.corners.bl.y * preScale },
-      };
-      try { src = warpPerspective(src, sc); } catch (e) { console.warn('warp 실패', e); }
+      const dn = (p) => ({ x: p.x * preScale, y: p.y * preScale }); // 원본 좌표 → 다운스케일 좌표
+      const sc = { tl: dn(page.corners.tl), tr: dn(page.corners.tr), br: dn(page.corners.br), bl: dn(page.corners.bl) };
+      try {
+        if (page.curves) {
+          const cs = { top: page.curves.top.map(dn), bottom: page.curves.bottom.map(dn) };
+          src = warpCurved(src, sc, cs); // 곡선 경계 메시 워프 — 책 곡면까지 폄
+        } else {
+          src = warpPerspective(src, sc);
+        }
+      } catch (e) {
+        console.warn('warp 실패', e);
+        try { src = warpPerspective(src, sc); } catch (e2) { /* 원본 유지 */ }
+      }
     }
 
     // 2) 최종 크기 맞춤
@@ -526,7 +682,9 @@ function startLiveOverlay() {
       work.width = Math.round(vw * s); work.height = Math.round(vh * s);
       work.getContext('2d').drawImage(video, 0, 0, work.width, work.height);
 
-      const found = findDocQuad(work, 0.15);
+      const foundRes = findDocQuad(work, 0.15);
+      const found = foundRes ? foundRes.quad : null;
+      liveDetect.curves = foundRes ? extractCurves(foundRes.contour, foundRes.quad) : null;
       if (found) {
         liveDetect.hitStreak++;
         liveDetect.missStreak = 0;
@@ -575,6 +733,18 @@ function startLiveOverlay() {
           octx.arc(x, y, 5, 0, Math.PI * 2);
           octx.fill();
         }
+        // 곡면이 감지되면 상·하 곡선 표시 (평탄화가 적용될 실제 경계)
+        if (liveDetect.curves && stable) {
+          octx.strokeStyle = 'rgba(244, 63, 94, 0.85)';
+          octx.lineWidth = 2;
+          for (const key of ['top', 'bottom']) {
+            const cps = liveDetect.curves[key].map(map);
+            octx.beginPath();
+            octx.moveTo(cps[0][0], cps[0][1]);
+            for (let i = 1; i < cps.length; i++) octx.lineTo(cps[i][0], cps[i][1]);
+            octx.stroke();
+          }
+        }
       }
       if (hint) {
         if (stable) {
@@ -620,6 +790,7 @@ async function addPage(blob, silent = false) {
     id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random(),
     blob,
     corners: null,
+    curves: null,
     autoChecked: false,
     rotation: 0,
     filter: 'magic',
@@ -1057,7 +1228,9 @@ async function openCornerModal() {
   cornerUI.bmpCanvas = c;
   cornerUI.corners = page.corners
     ? JSON.parse(JSON.stringify(page.corners))
-    : defaultCorners(bmp ? cornerUI.imgW : 0, cornerUI.imgH);
+    : defaultCorners(cornerUI.imgW, cornerUI.imgH);
+  cornerUI.detectedCurves = page.curves ? JSON.parse(JSON.stringify(page.curves)) : null;
+  cornerUI.handleMoved = false;
   $('corner-modal').classList.add('open');
   requestAnimationFrame(layoutCornerStage);
 }
@@ -1106,6 +1279,7 @@ function initCornerHandles() {
       e.preventDefault();
       h.setPointerCapture(e.pointerId);
       const key = h.dataset.c;
+      cornerUI.handleMoved = true; // 직접 조정 → 곡선 대신 직선 사각형 적용
       const move = (ev) => {
         const rect = $('corner-stage').getBoundingClientRect();
         const x = (ev.clientX - rect.left - cornerUI.offX) / cornerUI.dispScale;
@@ -1128,17 +1302,22 @@ function initCornerHandles() {
 
 async function cornerAutoDetect() {
   const page = cornerUI.page;
-  const saved = page.corners;
+  const savedCorners = page.corners;
+  const savedCurves = page.curves;
   page.corners = null;
+  page.curves = null;
   page.autoChecked = false;
   await detectCorners(page);
   if (page.corners) {
     cornerUI.corners = JSON.parse(JSON.stringify(page.corners));
-    toast('문서 영역을 자동 감지했습니다', { type: 'success', duration: 1500 });
+    cornerUI.detectedCurves = page.curves ? JSON.parse(JSON.stringify(page.curves)) : null;
+    cornerUI.handleMoved = false; // 핸들을 안 건드리면 감지된 곡선까지 적용
+    toast(page.curves ? '문서 영역 감지 (곡면 포함)' : '문서 영역을 자동 감지했습니다', { type: 'success', duration: 1500 });
   } else {
     toast('자동 감지 실패 — 직접 조정해 주세요', { type: 'error' });
   }
-  page.corners = saved; // 적용 버튼을 눌러야 확정
+  page.corners = savedCorners; // 적용 버튼을 눌러야 확정
+  page.curves = savedCurves;
   drawCornerOverlay();
 }
 
@@ -1147,6 +1326,10 @@ function closeCornerModal() { $('corner-modal').classList.remove('open'); corner
 function applyCorners(useFull) {
   const page = cornerUI.page;
   page.corners = useFull ? null : JSON.parse(JSON.stringify(cornerUI.corners));
+  // 자동감지 결과를 그대로 적용하면 곡선 유지, 핸들을 직접 움직였으면 직선 사각형
+  page.curves = (!useFull && cornerUI.detectedCurves && !cornerUI.handleMoved)
+    ? cornerUI.detectedCurves
+    : null;
   page.autoChecked = true;
   closeCornerModal();
   markDirtyAndRedraw(page);
@@ -1244,6 +1427,7 @@ async function restoreSession() {
     rows.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
     state.pages = rows.map((r) => ({
       id: r.id, blob: r.blob, corners: r.corners || null,
+      curves: r.curves || null,
       autoChecked: r.autoChecked ?? true,
       rotation: r.rotation || 0, filter: r.filter || 'magic',
       bright: r.bright || 0, contrast: r.contrast || 0,
