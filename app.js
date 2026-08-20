@@ -55,19 +55,6 @@ function toast(msg, opts = {}) {
   return dismiss;
 }
 
-function startClock() {
-  const el = $('header-clock');
-  const tick = () => {
-    const d = new Date();
-    let h = d.getHours();
-    const ap = h < 12 ? 'AM' : 'PM';
-    h = h % 12 || 12;
-    el.innerHTML = `${ap} ${String(h).padStart(2, '0')}<span class="blink-colon">:</span>${String(d.getMinutes()).padStart(2, '0')}`;
-  };
-  tick();
-  setInterval(tick, 1000);
-}
-
 /* ============================================================
    IndexedDB — 작업 유실 방지 (브라우저 닫아도 복원)
    ============================================================ */
@@ -722,9 +709,110 @@ let editRenderSeq = 0;
 
 function currentPage() { return state.pages[state.editIdx] || null; }
 
+/* ---------- 미리보기 핀치 확대/축소 + 이동 + 더블탭 ---------- */
+const editZoom = { scale: 1, tx: 0, ty: 0 };
+
+function applyEditZoom() {
+  $('edit-canvas').style.transform =
+    `translate(${editZoom.tx}px, ${editZoom.ty}px) scale(${editZoom.scale})`;
+}
+
+function resetEditZoom() {
+  editZoom.scale = 1; editZoom.tx = 0; editZoom.ty = 0;
+  applyEditZoom();
+}
+
+function clampEditPan() {
+  const c = $('edit-canvas');
+  const maxX = ((editZoom.scale - 1) * c.clientWidth) / 2;
+  const maxY = ((editZoom.scale - 1) * c.clientHeight) / 2;
+  editZoom.tx = Math.max(-maxX, Math.min(maxX, editZoom.tx));
+  editZoom.ty = Math.max(-maxY, Math.min(maxY, editZoom.ty));
+}
+
+function initEditGestures() {
+  const wrap = document.querySelector('.edit-view-wrap');
+  let mode = null; // 'swipe' | 'pan' | 'pinch'
+  let startX = 0, startY = 0, startTx = 0, startTy = 0;
+  let startDist = 0, startScale = 1, pinchCx = 0, pinchCy = 0, lastTap = 0;
+
+  const dist2 = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+
+  wrap.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 2) {
+      mode = 'pinch';
+      startDist = dist2(e.touches);
+      startScale = editZoom.scale;
+      startTx = editZoom.tx; startTy = editZoom.ty;
+      const r = wrap.getBoundingClientRect();
+      pinchCx = (e.touches[0].clientX + e.touches[1].clientX) / 2 - r.left - r.width / 2;
+      pinchCy = (e.touches[0].clientY + e.touches[1].clientY) / 2 - r.top - r.height / 2;
+    } else if (e.touches.length === 1) {
+      const now = Date.now();
+      if (now - lastTap < 300) { // 더블탭: 2.5배 ↔ 원래대로
+        lastTap = 0;
+        if (editZoom.scale > 1) resetEditZoom();
+        else { editZoom.scale = 2.5; clampEditPan(); applyEditZoom(); }
+        mode = null;
+        return;
+      }
+      lastTap = now;
+      startX = e.touches[0].clientX; startY = e.touches[0].clientY;
+      startTx = editZoom.tx; startTy = editZoom.ty;
+      mode = editZoom.scale > 1 ? 'pan' : 'swipe';
+    }
+  }, { passive: true });
+
+  wrap.addEventListener('touchmove', (e) => {
+    if (mode === 'pinch' && e.touches.length === 2) {
+      e.preventDefault();
+      const s = Math.min(5, Math.max(1, (startScale * dist2(e.touches)) / startDist));
+      const k = s / startScale; // 손가락 중심점이 고정되도록 이동 보정
+      editZoom.tx = pinchCx - k * (pinchCx - startTx);
+      editZoom.ty = pinchCy - k * (pinchCy - startTy);
+      editZoom.scale = s;
+      clampEditPan();
+      applyEditZoom();
+    } else if (mode === 'pan' && e.touches.length === 1) {
+      e.preventDefault();
+      editZoom.tx = startTx + e.touches[0].clientX - startX;
+      editZoom.ty = startTy + e.touches[0].clientY - startY;
+      clampEditPan();
+      applyEditZoom();
+    }
+  }, { passive: false });
+
+  wrap.addEventListener('touchend', (e) => {
+    if (mode === 'swipe' && e.changedTouches.length) {
+      const dx = e.changedTouches[0].clientX - startX;
+      const dy = e.changedTouches[0].clientY - startY;
+      if (Math.abs(dx) > 60 && Math.abs(dy) < 80) {
+        if (dx < 0 && state.editIdx < state.pages.length - 1) { state.editIdx++; renderEdit(); }
+        else if (dx > 0 && state.editIdx > 0) { state.editIdx--; renderEdit(); }
+      }
+    }
+    if (e.touches.length === 0) mode = null;
+    else if (e.touches.length === 1) { // 핀치 → 한 손가락 남으면 이동으로 전환
+      mode = editZoom.scale > 1 ? 'pan' : null;
+      startX = e.touches[0].clientX; startY = e.touches[0].clientY;
+      startTx = editZoom.tx; startTy = editZoom.ty;
+    }
+  }, { passive: true });
+
+  // 데스크톱: 휠 줌
+  wrap.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    editZoom.scale = Math.min(5, Math.max(1, editZoom.scale * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
+    if (editZoom.scale === 1) { editZoom.tx = 0; editZoom.ty = 0; }
+    clampEditPan();
+    applyEditZoom();
+  }, { passive: false });
+}
+
 async function renderEdit() {
   const page = currentPage();
   if (!page) { show('gallery'); return; }
+  resetEditZoom();
   $('edit-pos').textContent = `${state.editIdx + 1} / ${state.pages.length}`;
   $('btn-edit-prev').disabled = state.editIdx === 0;
   $('btn-edit-next').disabled = state.editIdx === state.pages.length - 1;
@@ -1069,18 +1157,8 @@ function bindEvents() {
   $('sl-bright').oninput = onSlider;
   $('sl-contrast').oninput = onSlider;
 
-  // 편집 화면 스와이프로 페이지 이동
-  let touchX = null;
-  const view = document.querySelector('.edit-view-wrap');
-  view.addEventListener('touchstart', (e) => { touchX = e.touches[0].clientX; }, { passive: true });
-  view.addEventListener('touchend', (e) => {
-    if (touchX === null) return;
-    const dx = e.changedTouches[0].clientX - touchX;
-    touchX = null;
-    if (Math.abs(dx) < 60) return;
-    if (dx < 0 && state.editIdx < state.pages.length - 1) { state.editIdx++; renderEdit(); }
-    else if (dx > 0 && state.editIdx > 0) { state.editIdx--; renderEdit(); }
-  }, { passive: true });
+  // 편집 화면 제스처: 핀치 확대/축소·이동·더블탭·스와이프 페이지 이동
+  initEditGestures();
 
   // 수동 영역보정
   initCornerHandles();
@@ -1112,14 +1190,13 @@ function bindEvents() {
 }
 
 async function init() {
-  startClock();
   bindEvents();
   await restoreSession();
   show('capture');
   startLiveOverlay();
   initCV(); // 백그라운드 — UI를 막지 않음
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('sw.js?v=1.0.0').catch(() => {});
+    navigator.serviceWorker.register('sw.js?v=1.0.1').catch(() => {});
   }
 }
 
