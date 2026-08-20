@@ -618,6 +618,128 @@ function warpCurved(canvas, quad, curves) {
   return out;
 }
 
+/* 가이드 기준 감지: 사용자가 가이드 프레임에 책을 맞춰 찍었다는 전제로,
+   가이드 선 주변 좁은 밴드에서만 실제 경계를 스냅. 못 찾은 변은 가이드 선 그대로 사용
+   — 자동 감지가 어긋나도 항상 가이드 근처의 예측 가능한 결과를 보장 */
+function guideAnchoredQuad(canvas) {
+  const W = canvas.width, H = canvas.height;
+  const gx0 = W * GUIDE_INSET, gy0 = H * GUIDE_INSET;
+  const gx1 = W * (1 - GUIDE_INSET), gy1 = H * (1 - GUIDE_INSET);
+  const src = cv.imread(canvas);
+  const gray = new cv.Mat();
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+  const blur = new cv.Mat();
+  cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
+  const gxm = new cv.Mat(), gym = new cv.Mat(), grad = new cv.Mat();
+  cv.Sobel(blur, gxm, cv.CV_16S, 1, 0, 3);
+  cv.Sobel(blur, gym, cv.CV_16S, 0, 1, 3);
+  cv.convertScaleAbs(gxm, gxm);
+  cv.convertScaleAbs(gym, gym);
+  cv.addWeighted(gxm, 0.5, gym, 0.5, 0, grad);
+  src.delete(); gray.delete(); blur.delete(); gxm.delete(); gym.delete();
+
+  const band = Math.round(Math.max(W, H) * 0.05);
+  const S = 17;
+  const snapEdge = (A, B) => {
+    const ex = B.x - A.x, ey = B.y - A.y;
+    const L = Math.hypot(ex, ey) || 1;
+    const nx = -ey / L, ny = ex / L;
+    const samples = [];
+    for (let i = 0; i < S; i++) {
+      const t = 0.07 + (0.86 * i) / (S - 1);
+      const px = A.x + ex * t, py = A.y + ey * t;
+      let bestD = null, bestScore = 12;
+      for (let d = -band; d <= band; d++) {
+        const x = Math.round(px + nx * d), y = Math.round(py + ny * d);
+        if (x < 0 || y < 0 || x >= W || y >= H) continue;
+        const g = grad.ucharPtr(y, x)[0] * (1 - (0.35 * Math.abs(d)) / band);
+        if (g > bestScore) { bestScore = g; bestD = d; }
+      }
+      samples.push({ t, d: bestD === null ? 0 : bestD }); // 못 찾으면 가이드 선(0)
+    }
+    // 직선 성분 강건 피팅 + 베지어 잔차(곡선)
+    const fitLine = (pts) => {
+      let st = 0, sd = 0, stt = 0, std2 = 0;
+      for (const { t, d } of pts) { st += t; sd += d; stt += t * t; std2 += t * d; }
+      const n = pts.length, den = n * stt - st * st;
+      if (Math.abs(den) < 1e-9) return [0, 0];
+      const b = (n * std2 - st * sd) / den;
+      return [(sd - b * st) / n, b];
+    };
+    let lc = fitLine(samples);
+    const res = samples.map(({ t, d }) => Math.abs(d - (lc[0] + lc[1] * t)));
+    const med = [...res].sort((x, y) => x - y)[res.length >> 1] || 0;
+    const kept = samples.filter((_, i) => res[i] <= Math.max(4, med * 3));
+    if (kept.length >= 6) lc = fitLine(kept);
+    const bez = fitBezierDeviation(kept.map(({ t, d }) => ({ t, d: d - (lc[0] + lc[1] * t) })));
+    return { A, B, nx, ny, a: lc[0], b: lc[1], bez };
+  };
+
+  const top = snapEdge({ x: gx0, y: gy0 }, { x: gx1, y: gy0 });
+  const bottom = snapEdge({ x: gx0, y: gy1 }, { x: gx1, y: gy1 });
+  const left = snapEdge({ x: gx0, y: gy0 }, { x: gx0, y: gy1 });
+  const right = snapEdge({ x: gx1, y: gy0 }, { x: gx1, y: gy1 });
+  grad.delete();
+
+  const lineOf = (e) => [
+    { x: e.A.x + e.nx * e.a, y: e.A.y + e.ny * e.a },
+    { x: e.B.x + e.nx * (e.a + e.b), y: e.B.y + e.ny * (e.a + e.b) },
+  ];
+  const xsect = (p, q, r2, s2) => {
+    const d1x = q.x - p.x, d1y = q.y - p.y, d2x = s2.x - r2.x, d2y = s2.y - r2.y;
+    const den = d1x * d2y - d1y * d2x;
+    if (Math.abs(den) < 1e-9) return null;
+    const u = ((r2.x - p.x) * d2y - (r2.y - p.y) * d2x) / den;
+    return { x: p.x + u * d1x, y: p.y + u * d1y };
+  };
+  const [t0, t1] = lineOf(top), [b0, b1] = lineOf(bottom);
+  const [l0, l1] = lineOf(left), [r0, r1] = lineOf(right);
+  const tl = xsect(t0, t1, l0, l1) || { x: gx0, y: gy0 };
+  const tr = xsect(t0, t1, r0, r1) || { x: gx1, y: gy0 };
+  const bl = xsect(b0, b1, l0, l1) || { x: gx0, y: gy1 };
+  const br = xsect(b0, b1, r0, r1) || { x: gx1, y: gy1 };
+  const quad = { tl, tr, bl, br };
+  if (!quadAnglesOk(quad)) return { quad: { tl: { x: gx0, y: gy0 }, tr: { x: gx1, y: gy0 }, bl: { x: gx0, y: gy1 }, br: { x: gx1, y: gy1 } }, curves: null };
+
+  const mkCurve = (edge, A, B) => {
+    if (!edge.bez) return null;
+    const ex = B.x - A.x, ey = B.y - A.y;
+    const L = Math.hypot(ex, ey) || 1;
+    const nx = -ey / L, ny = ex / L;
+    let maxDev = 0;
+    for (let i = 0; i <= 16; i++) maxDev = Math.max(maxDev, Math.abs(edge.bez(i / 16)));
+    // 책 촬영에서는 곡선일 확률이 높음 — 문턱을 낮춰 웬만하면 곡선으로 채택
+    if (maxDev < Math.max(1.5, L * 0.005)) return null;
+    return Array.from({ length: CURVE_SAMPLES }, (_, i) => {
+      const t = i / (CURVE_SAMPLES - 1);
+      const d = edge.bez(t);
+      return { x: A.x + ex * t + nx * d, y: A.y + ey * t + ny * d };
+    });
+  };
+  const cT = mkCurve(top, tl, tr), cB = mkCurve(bottom, bl, br);
+  const cL = mkCurve(left, tl, bl), cR = mkCurve(right, tr, br);
+  const curves = (cT || cB || cL || cR) ? {
+    top: cT || sampleLine(tl, tr, CURVE_SAMPLES),
+    bottom: cB || sampleLine(bl, br, CURVE_SAMPLES),
+    left: cL || sampleLine(tl, bl, CURVE_SAMPLES),
+    right: cR || sampleLine(tr, br, CURVE_SAMPLES),
+  } : null;
+  return { quad, curves };
+}
+
+/* 사각형 bbox와 가이드 영역의 IoU — 자동 감지가 가이드와 동떨어졌는지 판정 */
+function bboxIouWithGuide(quad, W, H) {
+  const xs = [quad.tl.x, quad.tr.x, quad.br.x, quad.bl.x];
+  const ys = [quad.tl.y, quad.tr.y, quad.br.y, quad.bl.y];
+  const ax0 = Math.min(...xs), ax1 = Math.max(...xs), ay0 = Math.min(...ys), ay1 = Math.max(...ys);
+  const gx0 = W * GUIDE_INSET, gx1 = W * (1 - GUIDE_INSET), gy0 = H * GUIDE_INSET, gy1 = H * (1 - GUIDE_INSET);
+  const ix = Math.max(0, Math.min(ax1, gx1) - Math.max(ax0, gx0));
+  const iy = Math.max(0, Math.min(ay1, gy1) - Math.max(ay0, gy0));
+  const inter = ix * iy;
+  const uni = (ax1 - ax0) * (ay1 - ay0) + (gx1 - gx0) * (gy1 - gy0) - inter;
+  return uni > 0 ? inter / uni : 0;
+}
+
 async function detectCorners(page) {
   page.autoChecked = true;
   if (!state.cvReady) return;
@@ -650,6 +772,16 @@ async function detectCorners(page) {
         contour.delete();
       }
       img.delete();
+    }
+
+    // 가이드 기준 보정: 카메라 촬영본에서 자동 감지가 없거나 가이드와 동떨어지면
+    // 가이드 프레임 주변에서 경계를 스냅 (사용자가 가이드에 맞춰 찍었다는 전제)
+    if (page.fromCamera && state.cvReady) {
+      const iou = corners ? bboxIouWithGuide(corners, c.width, c.height) : 0;
+      if (iou < 0.45) {
+        const g = guideAnchoredQuad(c);
+        if (g) { corners = g.quad; curves = g.curves; }
+      }
     }
 
     if (corners) {
@@ -981,6 +1113,42 @@ function stopCamera() {
   }
 }
 
+/* 촬영 가이드: 카메라 영상(레터박스 안쪽)에 정확히 정렬된 기준 프레임.
+   좌측 빨간 세로 점선 = 기준선, 네 모서리 꺾쇠 = 책 모서리를 맞추는 위치 */
+const GUIDE_INSET = 0.06;
+
+function updateGuidePosition() {
+  const wrap = document.querySelector('.cam-wrap');
+  const g = document.querySelector('.frame-guide');
+  const video = $('cam');
+  if (!wrap || !g) return;
+  const cw = wrap.clientWidth, ch = wrap.clientHeight;
+  const vw = video.videoWidth || 3, vh = video.videoHeight || 4;
+  const fit = Math.min(cw / vw, ch / vh);
+  const w = vw * fit, h = vh * fit;
+  const ox = (cw - w) / 2, oy = (ch - h) / 2;
+  g.style.left = `${ox + w * GUIDE_INSET}px`;
+  g.style.top = `${oy + h * GUIDE_INSET}px`;
+  g.style.width = `${w * (1 - 2 * GUIDE_INSET)}px`;
+  g.style.height = `${h * (1 - 2 * GUIDE_INSET)}px`;
+}
+
+/* 회전 후 스트림 방향이 화면과 어긋난 채 남는 기기 대응 — 주기 감시로 자가 복구 */
+function startOrientationWatchdog() {
+  setInterval(() => {
+    updateGuidePosition();
+    if (state.screen !== 'capture' || !state.stream || document.hidden || state._rotFixing) return;
+    const st = state.stream.getVideoTracks()[0]?.getSettings() || {};
+    const winL = window.innerWidth > window.innerHeight;
+    const vidL = (st.width || 0) > (st.height || 0);
+    if ((st.width || 0) > 0 && vidL !== winL) {
+      state._rotFixing = true;
+      stopCamera();
+      startCamera().finally(() => setTimeout(() => { state._rotFixing = false; }, 1500));
+    }
+  }, 1200);
+}
+
 /* 실시간 문서 감지 오버레이 — 시간 평활(EMA)로 떨림 억제 + 안정 상태 표시 */
 const liveDetect = { quad: null, hitStreak: 0, missStreak: 0 };
 
@@ -1144,11 +1312,12 @@ async function capture() {
   c.height = Math.round(video.videoHeight * scale);
   c.getContext('2d').drawImage(video, 0, 0, c.width, c.height);
   const blob = await new Promise((res) => c.toBlob(res, 'image/jpeg', 0.92));
-  await addCapturedBlob(blob, false);
+  await addCapturedBlob(blob, false, true);
 }
 
-/* 촬영/불러오기 공통 진입점 — 펼침면 모드면 좌/우 분할 시도 */
-async function addCapturedBlob(blob, silent) {
+/* 촬영/불러오기 공통 진입점 — 펼침면 모드면 좌/우 분할 시도
+   fromCamera=true면 가이드 프레임에 맞춰 찍었다고 보고 가이드 기준 보정을 허용 */
+async function addCapturedBlob(blob, silent, fromCamera = false) {
   if (state.spreadMode) {
     if (!state.cvReady) {
       if (!silent) toast('보정 엔진 로딩 후 분할 가능 — 한 장으로 저장됨', { type: 'error' });
@@ -1158,7 +1327,7 @@ async function addCapturedBlob(blob, silent) {
       toast('페이지 감지 실패 — 한 장으로 저장됨', { type: 'error' });
     }
   }
-  await addPage(blob, silent);
+  await addPage(blob, silent, false, fromCamera);
 }
 
 /* 세로 커널 닫기: 어두운 "가로 띠"(스프링 제본·자·그림자)로 갈라진 밝은 영역을 위아래로 이어붙임.
@@ -1388,12 +1557,13 @@ function findSpineX(canvas) {
 }
 
 /* 페이지 추가 (촬영/불러오기 공용). preprocessed=true면 이미 보정된 이미지라 감지 생략 */
-async function addPage(blob, silent = false, preprocessed = false) {
+async function addPage(blob, silent = false, preprocessed = false, fromCamera = false) {
   const page = {
     id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random(),
     blob,
     corners: null,
     curves: null,
+    fromCamera,
     autoChecked: preprocessed,
     rotation: 0,
     filter: 'magic',
@@ -2213,6 +2383,7 @@ async function init() {
   await restoreSession();
   show('capture');
   startLiveOverlay();
+  startOrientationWatchdog();
   initCV(); // 백그라운드 — UI를 막지 않음
   initServiceWorker();
 }

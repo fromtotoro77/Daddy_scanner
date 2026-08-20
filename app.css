@@ -345,18 +345,27 @@ main {
   box-shadow: 0 0 8px rgba(244, 63, 94, 0.6);
 }
 
-/* 촬영 가이드 프레임 — 책을 이 브래킷 안에 맞추도록 유도 */
+/* 촬영 가이드 프레임 — 책을 이 안에 맞추도록 유도 (위치는 JS가 영상 영역에 정렬) */
 .frame-guide {
   position: absolute;
-  inset: 6%;
+  inset: 6%; /* 초기값 — updateGuidePosition()이 영상 영역 기준으로 재배치 */
   z-index: 1;
   pointer-events: none;
+}
+/* 좌측 기준선: 책의 왼쪽 변(또는 책등)을 여기에 맞춤 */
+.frame-guide .left-anchor {
+  position: absolute;
+  left: -2px;
+  top: 0;
+  height: 100%;
+  border-left: 3px dashed rgba(244, 63, 94, 0.9);
+  filter: drop-shadow(0 0 4px rgba(244, 63, 94, 0.5));
 }
 .frame-guide i {
   position: absolute;
   width: 28px;
   height: 28px;
-  border: 3px solid rgba(255, 255, 255, 0.38);
+  border: 3px solid rgba(255, 255, 255, 0.55);
 }
 .frame-guide i:nth-child(1) { top: 0; left: 0; border-right: 0; border-bottom: 0; border-radius: 8px 0 0 0; }
 .frame-guide i:nth-child(2) { top: 0; right: 0; border-left: 0; border-bottom: 0; border-radius: 0 8px 0 0; }
