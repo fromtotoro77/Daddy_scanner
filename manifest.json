@@ -1,7 +1,7 @@
 {
-  "name": "Daddy Scanner",
+  "name": "Daddy Scanner · to miyeong",
   "short_name": "Daddy Scanner",
-  "description": "책·문서를 촬영해 보정하고 PDF로 만드는 스캐너 — daddy 시리즈",
+  "description": "책·문서를 촬영해 보정하고 PDF로 만드는 스캐너 — daddy 시리즈, to miyeong",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",

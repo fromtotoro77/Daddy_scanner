@@ -1545,7 +1545,21 @@ function bindEvents() {
   });
 }
 
+function dismissSplash() {
+  const el = $('splash');
+  if (!el) return;
+  // 세션 첫 실행에만 온전히 보여주고, 자동 업데이트 새로고침 등에선 짧게
+  const seen = sessionStorage.getItem('splashSeen');
+  const delay = seen ? 200 : 1500;
+  sessionStorage.setItem('splashSeen', '1');
+  setTimeout(() => {
+    el.classList.add('out');
+    setTimeout(() => el.remove(), 550);
+  }, delay);
+}
+
 async function init() {
+  dismissSplash();
   bindEvents();
   await restoreSession();
   show('capture');
