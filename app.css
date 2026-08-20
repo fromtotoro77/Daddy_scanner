@@ -394,6 +394,8 @@ main {
   transition: all 0.2s;
 }
 .spread-toggle svg { width: 14px; height: 14px; fill: currentColor; }
+/* 카메라 방향 수동 전환 버튼 — 펼침면 토글 아래 */
+.cam-rotate { top: calc(0.8rem + 40px); }
 .spread-toggle:active { transform: scale(0.95); }
 .spread-toggle.on {
   color: #0c0c0e;

@@ -1049,7 +1049,8 @@ function bcInPlace(d, bright, contrast) {
    (정사각 2560×2560 이상값을 주면 가로형 모드가 "가장 가깝다"고 선택되어
    세로 화면에서 가로 프레임이 오는 첫 실행 짤림이 발생 — 방향을 명시해서 방지) */
 function camConstraints() {
-  const portrait = window.innerHeight >= window.innerWidth;
+  let portrait = window.innerHeight >= window.innerWidth;
+  if (state.camFlip) portrait = !portrait; // 사용자가 회전 버튼으로 방향을 뒤집은 경우
   return {
     facingMode: { ideal: 'environment' },
     width: { ideal: portrait ? 1440 : 2560 },
@@ -1077,9 +1078,10 @@ async function startCamera(isRetry = false) {
       const bad = () => {
         const st = track.getSettings();
         const lowRes = (st.width || 0) * (st.height || 0) < 1200 * 900;
-        const winLandscape = window.innerWidth > window.innerHeight;
+        let wantLandscape = window.innerWidth > window.innerHeight;
+        if (state.camFlip) wantLandscape = !wantLandscape; // 사용자의 수동 방향 선택 존중
         const vidLandscape = (st.width || 0) > (st.height || 0);
-        return lowRes || vidLandscape !== winLandscape;
+        return lowRes || vidLandscape !== wantLandscape;
       };
       if (bad()) {
         try {
@@ -1133,29 +1135,19 @@ function updateGuidePosition() {
   g.style.height = `${h * (1 - 2 * GUIDE_INSET)}px`;
 }
 
-/* 회전 후 스트림 방향이 화면과 어긋난 채 남는 기기 대응.
-   ⚠ 방향 전환 1회당 재시도 최대 2번 — 스트림이 끝내 가로로만 나오는 기기에서
-   무한 재시작 루프("카메라 준비 중" 반복)에 빠지지 않도록 포기하고 촬영 가능 상태 유지 */
-let _rotTries = 0;
-let _rotLastWinL = null;
+/* 방향 전환은 사용자가 회전 버튼으로 직접 제어 (자동 재시작은 기기별 무한 루프 위험으로 제거).
+   여기서는 가이드 위치 갱신만 주기적으로 수행 */
 function startOrientationWatchdog() {
-  setInterval(() => {
-    updateGuidePosition();
-    if (state.screen !== 'capture' || !state.stream || document.hidden || state._rotFixing) return;
-    const winL = window.innerWidth > window.innerHeight;
-    if (winL !== _rotLastWinL) { _rotLastWinL = winL; _rotTries = 0; } // 실제 회전 시에만 카운터 리셋
-    if (_rotTries >= 2) return; // 이 방향에서는 이미 포기
-    const st = state.stream.getVideoTracks()[0]?.getSettings() || {};
-    const vidL = (st.width || 0) > (st.height || 0);
-    if ((st.width || 0) > 0 && vidL !== winL) {
-      _rotTries++;
-      state._rotFixing = true;
-      stopCamera();
-      setTimeout(() => {
-        startCamera().finally(() => setTimeout(() => { state._rotFixing = false; }, 1500));
-      }, 350); // 이전 트랙이 완전히 해제될 시간을 준 뒤 재시작
-    }
-  }, 1200);
+  setInterval(updateGuidePosition, 1200);
+}
+
+/* 카메라 방향 수동 전환 — 미리보기가 가로/세로로 잘못 나올 때 사용자가 누름 */
+async function flipCameraOrientation() {
+  state.camFlip = !state.camFlip;
+  stopCamera();
+  await new Promise((r) => setTimeout(r, 300));
+  await startCamera();
+  toast(state.camFlip ? '카메라 방향 전환됨' : '카메라 기본 방향', { duration: 1200 });
 }
 
 /* 실시간 문서 감지 오버레이 — 시간 평활(EMA)로 떨림 억제 + 안정 상태 표시 */
@@ -2230,6 +2222,7 @@ function bindEvents() {
 
   // 촬영
   $('btn-shutter').onclick = capture;
+  $('btn-cam-rotate').onclick = flipCameraOrientation;
   $('btn-spread').classList.toggle('on', state.spreadMode);
   $('btn-spread').onclick = () => {
     state.spreadMode = !state.spreadMode;
