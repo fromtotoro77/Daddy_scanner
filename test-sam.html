@@ -11,7 +11,9 @@ canvas { max-width:100%; border-radius:10px; margin-top:0.6rem; }
 </head>
 <body>
 <h3>SlimSAM(경량 SAM) — 중앙점 프롬프트 사물 경계 실측</h3>
-<input type="file" id="file" accept="image/*">
+<button id="btn-load" style="width:100%;padding:0.9rem;margin:0.3rem 0;background:#d4d4d8;color:#0c0c0e;border:none;border-radius:12px;font-size:0.95rem;font-weight:700;">1) 모델 다운로드 + 로드 (최초 1회, Wi-Fi 권장)</button>
+<button id="btn-pick" disabled style="width:100%;padding:0.9rem;margin:0.3rem 0;background:rgba(255,255,255,0.06);color:#eee;border:1px solid rgba(255,255,255,0.15);border-radius:12px;font-size:0.95rem;font-weight:700;">2) 책 사진 선택 → 경계 분할 실행</button>
+<input type="file" id="file" accept="image/*" hidden>
 <div id="log">대기…</div>
 <canvas id="out"></canvas>
 <script type="module">
@@ -99,6 +101,18 @@ window.runSam = async function (f) {
     }
 };
 
+document.getElementById('btn-load').onclick = async () => {
+    const b = document.getElementById('btn-load');
+    b.disabled = true;
+    try {
+        await window.loadSam();
+        document.getElementById('btn-pick').disabled = false;
+    } catch (e) {
+        log('로드 실패: ' + e);
+        b.disabled = false;
+    }
+};
+document.getElementById('btn-pick').onclick = () => document.getElementById('file').click();
 document.getElementById('file').onchange = (ev) => {
     const f = ev.target.files[0];
     ev.target.value = '';
