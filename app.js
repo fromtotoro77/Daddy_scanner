@@ -138,8 +138,9 @@ function orderQuad(pts) {
   return { tl: bySum[0], br: bySum[3], bl: byDiff[0], tr: byDiff[3] };
 }
 
-/* 이진 엣지 맵에서 가장 큰 볼록 사각형을 찾는다 (원시 윤곽선도 함께 반환 — 곡면 추출용) */
-function scanQuads(binMat, imgArea, minRatio) {
+/* 이진 맵에서 가장 큰 볼록 사각형을 찾는다 (원시 윤곽선도 함께 반환 — 곡면 추출용)
+   maxRatio: 화면 거의 전체를 덮는 프레임 오감지 방지 */
+function scanQuads(binMat, imgArea, minRatio, maxRatio = 0.985) {
   let best = null, bestArea = 0, bestContour = null;
   const contours = new cv.MatVector();
   const hier = new cv.Mat();
@@ -147,20 +148,29 @@ function scanQuads(binMat, imgArea, minRatio) {
   for (let i = 0; i < contours.size(); i++) {
     const cnt = contours.get(i);
     const area = cv.contourArea(cnt);
-    if (area < imgArea * minRatio || area <= bestArea) { cnt.delete(); continue; }
+    if (area < imgArea * minRatio || area > imgArea * maxRatio || area <= bestArea) { cnt.delete(); continue; }
+    // 곡면 페이지도 4점으로 잡히도록 근사 강도를 올려가며 시도
     const peri = cv.arcLength(cnt, true);
-    const approx = new cv.Mat();
-    cv.approxPolyDP(cnt, approx, 0.03 * peri, true);
-    if (approx.rows === 4 && cv.isContourConvex(approx)) {
-      const pts = [];
-      for (let j = 0; j < 4; j++) pts.push({ x: approx.data32S[j * 2], y: approx.data32S[j * 2 + 1] });
-      best = orderQuad(pts);
+    let quad = null;
+    for (const k of [0.02, 0.035, 0.05, 0.08]) {
+      const approx = new cv.Mat();
+      if (quad === null) {
+        cv.approxPolyDP(cnt, approx, k * peri, true);
+        if (approx.rows === 4 && cv.isContourConvex(approx)) {
+          const pts = [];
+          for (let j = 0; j < 4; j++) pts.push({ x: approx.data32S[j * 2], y: approx.data32S[j * 2 + 1] });
+          quad = orderQuad(pts);
+        }
+      }
+      approx.delete();
+    }
+    if (quad) {
+      best = quad;
       bestArea = area;
       bestContour = [];
       const d = cnt.data32S;
       for (let j = 0; j < d.length; j += 2) bestContour.push({ x: d[j], y: d[j + 1] });
     }
-    approx.delete();
     cnt.delete();
   }
   contours.delete();
@@ -180,20 +190,21 @@ function findDocQuad(canvas, minRatio = 0.15) {
   const kernel = cv.Mat.ones(3, 3, cv.CV_8U);
   let best = null;
   try {
-    // 1차: 표준 엣지
-    cv.Canny(blur, bin, 60, 180);
-    cv.dilate(bin, bin, kernel, new cv.Point(-1, -1), 2);
-    best = scanQuads(bin, imgArea, minRatio);
-    // 2차: 저대비(책상과 종이 색이 비슷할 때)
+    // 1차: 밝은 종이 영역(페이지 전체) 우선 — 페이지 안의 표·글자 블록에 낚이지 않도록.
+    // 표/글자는 종이 안쪽 내용이라 밝은 영역의 바깥 윤곽에 영향을 주지 않는다.
+    cv.threshold(blur, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+    cv.morphologyEx(bin, bin, cv.MORPH_CLOSE, kernel, new cv.Point(-1, -1), 2);
+    cv.erode(bin, bin, kernel, new cv.Point(-1, -1), 1); // 옆 페이지와의 얇은 연결 절단
+    best = scanQuads(bin, imgArea, minRatio, 0.97);
+    // 2차: 표준 엣지 (종이와 배경 밝기가 비슷할 때)
     if (!best) {
-      cv.Canny(blur, bin, 20, 70);
+      cv.Canny(blur, bin, 60, 180);
       cv.dilate(bin, bin, kernel, new cv.Point(-1, -1), 2);
       best = scanQuads(bin, imgArea, minRatio);
     }
-    // 3차: 밝기 이진화 폴백(밝은 종이 + 어두운 배경)
+    // 3차: 저대비 엣지
     if (!best) {
-      cv.threshold(blur, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
-      cv.erode(bin, bin, kernel, new cv.Point(-1, -1), 1);
+      cv.Canny(blur, bin, 20, 70);
       cv.dilate(bin, bin, kernel, new cv.Point(-1, -1), 2);
       best = scanQuads(bin, imgArea, minRatio);
     }
