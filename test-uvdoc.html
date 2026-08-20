@@ -44,6 +44,7 @@
 
     <button id="btn-load" class="primary">1) 모델 다운로드 + 로드 (약 30MB, 최초 1회)</button>
     <button id="btn-pick" disabled>2) 책 사진 선택 → 평탄화 실행</button>
+    <button id="btn-clear">🗑 모델 캐시 삭제 (30MB 반환 — 스캔 데이터는 안 건드림)</button>
     <input type="file" id="file" accept="image/*" hidden>
 
     <div id="log">대기 중…</div>
@@ -114,6 +115,18 @@
             log('오류: ' + e.message, 'warn');
             document.getElementById('btn-load').disabled = false;
         }
+    };
+
+    document.getElementById('btn-clear').onclick = async () => {
+        const had = await caches.has('uvdoc-test');
+        await caches.delete('uvdoc-test');
+        session = null;
+        document.getElementById('btn-pick').disabled = true;
+        document.getElementById('btn-load').disabled = false;
+        lines = [];
+        log(had ? '모델 캐시 삭제 완료 — 30MB 반환됨' : '삭제할 모델 캐시가 없습니다', 'ok');
+        // 브라우저 HTTP 캐시에 남은 사본도 무효화되도록 안내
+        log('(다시 측정하려면 1번 버튼으로 재다운로드)');
     };
 
     document.getElementById('btn-pick').onclick = () => document.getElementById('file').click();
