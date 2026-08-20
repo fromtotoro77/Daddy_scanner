@@ -171,6 +171,26 @@ function scanQuads(binMat, imgArea, minRatio, maxRatio = 0.985, center = null) {
       }
       approx.delete();
     }
+    // 폴백: 복잡한 모양(주변 물체와 일부 병합 등)은 볼록껍질을 씌워 4점 근사
+    // — 잘못된 후보면 경계 지지도 채점에서 걸러진다
+    if (quad === null) {
+      const hull = new cv.Mat();
+      cv.convexHull(cnt, hull);
+      const periH = cv.arcLength(hull, true);
+      for (const k of [0.02, 0.04, 0.07, 0.1]) {
+        const ap = new cv.Mat();
+        if (quad === null) {
+          cv.approxPolyDP(hull, ap, k * periH, true);
+          if (ap.rows === 4) {
+            const pts = [];
+            for (let j = 0; j < 4; j++) pts.push({ x: ap.data32S[j * 2], y: ap.data32S[j * 2 + 1] });
+            quad = orderQuad(pts);
+          }
+        }
+        ap.delete();
+      }
+      hull.delete();
+    }
     if (quad) {
       best = quad;
       bestArea = area;
@@ -280,6 +300,50 @@ function centerComponentQuad(bin, imgArea, minRatio) {
   return best;
 }
 
+/* 색상거리 분할(사용자 제안 "색 차이"): 중앙(종이) 색을 시드로, Lab 색공간에서
+   시드와의 색 차이가 허용치를 넘는 픽셀에서 flood가 멈춘다.
+   밝기(L)는 곡면 그림자 때문에 넉넉히, 색조(a/b)는 엄격히 — 흰 책상 vs 흰 종이의 미묘한 톤 차이로 분리 */
+function colorRegionQuad(srcRgba, imgArea, minRatio) {
+  const rgb = new cv.Mat();
+  cv.cvtColor(srcRgba, rgb, cv.COLOR_RGBA2RGB);
+  // 블러 없이 변환 — 표 격자선 같은 가는 경계가 흐려져 flood가 넘는 것 방지
+  // (FIXED_RANGE 허용치가 픽셀 노이즈는 흡수)
+  const lab = new cv.Mat();
+  cv.cvtColor(rgb, lab, cv.COLOR_RGB2Lab);
+  rgb.delete();
+  const W = lab.cols, H = lab.rows;
+  // 시드가 글자·괘선(어두운 픽셀) 위에 있으면 근처의 밝은 종이 픽셀로 이동
+  let sx = -1, sy = -1;
+  outer:
+  for (let r = 0; r <= 60; r += 5) {
+    for (const [dx, dy] of [[0, 0], [r, 0], [-r, 0], [0, r], [0, -r], [r, r], [-r, -r], [r, -r], [-r, r]]) {
+      const x = (W >> 1) + dx, y = (H >> 1) + dy;
+      if (x >= 0 && y >= 0 && x < W && y < H && lab.ucharPtr(y, x)[0] >= 140) { sx = x; sy = y; break outer; }
+    }
+  }
+  if (sx < 0) { lab.delete(); return null; } // 중앙 부근에 종이가 없음
+  const ffMask = cv.Mat.zeros(H + 2, W + 2, cv.CV_8U);
+  let best = null;
+  try {
+    cv.floodFill(lab, ffMask, new cv.Point(sx, sy), new cv.Scalar(255, 255, 255),
+      new cv.Rect(), new cv.Scalar(42, 7, 7, 0), new cv.Scalar(42, 7, 7, 0),
+      4 | (255 << 8) | cv.FLOODFILL_MASK_ONLY | cv.FLOODFILL_FIXED_RANGE);
+    const roi = ffMask.roi(new cv.Rect(1, 1, W, H));
+    const comp = roi.clone();
+    roi.delete();
+    const k = cv.Mat.ones(3, 3, cv.CV_8U);
+    // 닫기 1회만 — 표 격자선(≥3px)이 녹아 표 내부가 한 덩어리로 합쳐지는 것 방지
+    cv.morphologyEx(comp, comp, cv.MORPH_CLOSE, k, new cv.Point(-1, -1), 1);
+    healHorizontalBands(comp); // 스프링 제본 대응
+    best = scanQuads(comp, imgArea, minRatio, 0.97, null);
+    comp.delete(); k.delete();
+  } catch (e) {
+    console.warn('colorRegionQuad 실패', e);
+  }
+  lab.delete(); ffMask.delete();
+  return best;
+}
+
 /* 캔버스에서 문서 사각형 감지 → {tl,tr,br,bl} (캔버스 좌표) 또는 null
    전략(각 베이스 마스크마다):
    ① 그림자 차단벽 절단 + 중앙 성분 선택 — 겹친 흰 책·잡동사니에 가장 강함
@@ -314,6 +378,7 @@ function findDocQuad(canvas, minRatio = 0.15, borderPenalty = true) {
   };
   let best = null;
   try {
+    push(colorRegionQuad(src, imgArea, minRatio), 'color'); // 색 차이 분할 — 최우선 후보
     const pm = paperMask(src);
     if (pm) { tryBase(pm); pm.delete(); }
     cv.threshold(blur, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
@@ -346,10 +411,10 @@ function findDocQuad(canvas, minRatio = 0.15, borderPenalty = true) {
           if (touched) c.score -= 0.35;
         }
       }
-      grad.delete();
       // 우선순위(수집 순서)대로, 점수가 충분한 첫 후보 채택.
       // 전부 부실하면 점수 최고를 채택 (병합 오감지가 우선순위만으로 뽑히는 것 방지)
       best = cands.find((c) => c.score >= 0.55) || cands.reduce((m2, c) => (c.score > m2.score ? c : m2));
+      grad.delete();
     }
   } catch (e) {
     console.warn('findDocQuad 실패', e);
@@ -564,7 +629,7 @@ async function detectCorners(page) {
 
     const found = findDocQuad(c, 0.15);
     let corners = found ? found.quad : null;
-    let curves = found ? extractCurves(found.contour, found.quad) : null;
+    let curves = found ? (found.curves || extractCurves(found.contour, found.quad)) : null;
 
     // 최후 폴백: jscanify 기본 감지 (곡선 없음)
     if (!corners) {
@@ -963,7 +1028,7 @@ function startLiveOverlay() {
 
       const foundRes = findDocQuad(work, 0.15);
       const found = foundRes ? foundRes.quad : null;
-      liveDetect.curves = foundRes ? extractCurves(foundRes.contour, foundRes.quad) : null;
+      liveDetect.curves = foundRes ? (foundRes.curves || extractCurves(foundRes.contour, foundRes.quad)) : null;
       if (found) {
         liveDetect.hitStreak++;
         liveDetect.missStreak = 0;
@@ -1108,13 +1173,13 @@ function findPageBlobs(canvas) {
     const R = findDocQuad(halfCanvas(mid, W - mid), 0.18, false);
     // 페이지 안쪽 변이 중앙선 근처에 닿아 있어야 진짜 펼침면 페이지
     if (L && Math.max(L.quad.tr.x, L.quad.br.x) > mid * 0.75) {
-      out.push({ quad: L.quad, contour: L.contour });
+      out.push({ quad: L.quad, contour: L.contour, curves: L.curves || null });
     }
     if (R) {
       const sh = (p) => ({ x: p.x + mid, y: p.y });
       const q = { tl: sh(R.quad.tl), tr: sh(R.quad.tr), br: sh(R.quad.br), bl: sh(R.quad.bl) };
       if (Math.min(q.tl.x, q.bl.x) < mid + (W - mid) * 0.25) {
-        out.push({ quad: q, contour: R.contour.map(sh) });
+        out.push({ quad: q, contour: R.contour.map(sh), curves: R.curves ? mapCurvePoints(R.curves, sh) : null });
       }
     }
   } catch (e) {
@@ -1148,7 +1213,7 @@ async function addSpreadPages(blob, silent) {
     if (blobs.length === 2) {
       // 이상적 경로: 페이지별로 각각 보정 → 곡면도 페이지 단위로 정확히 펴짐
       for (const b of blobs) {
-        const curves = extractCurves(b.contour, b.quad);
+        const curves = b.curves || extractCurves(b.contour, b.quad);
         const temp = {
           blob,
           corners: { tl: up(b.quad.tl), tr: up(b.quad.tr), br: up(b.quad.br), bl: up(b.quad.bl) },
