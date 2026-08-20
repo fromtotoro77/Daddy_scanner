@@ -530,14 +530,14 @@ function sampleLine(A, B, n) {
   });
 }
 
-/* 윤곽선 + 사각형 → 네 변 곡선 (휘어진 변은 곡선으로, 반듯한 변은 직선으로. 전부 직선이면 null) */
+/* 윤곽선 + 사각형 → 곡선 추출.
+   책 도메인 지식: 좌우 변은 직선, 상·하 변만 곡선이 된다 (펼친 책의 물리적 특성) */
 function extractCurves(contour, quad) {
   if (!contour || contour.length < 12) return null;
   const top = fitEdgeCurve(contour, quad.tl, quad.tr, quad);
   const bottom = fitEdgeCurve(contour, quad.bl, quad.br, quad);
-  const left = fitEdgeCurve(contour, quad.tl, quad.bl, quad);
-  const right = fitEdgeCurve(contour, quad.tr, quad.br, quad);
-  if (!top && !bottom && !left && !right) return null;
+  const left = null, right = null; // 좌우는 직선 고정
+  if (!top && !bottom) return null;
   return {
     top: top || sampleLine(quad.tl, quad.tr, CURVE_SAMPLES),
     bottom: bottom || sampleLine(quad.bl, quad.br, CURVE_SAMPLES),
@@ -717,7 +717,7 @@ function guideAnchoredQuad(canvas) {
     });
   };
   const cT = mkCurve(top, tl, tr), cB = mkCurve(bottom, bl, br);
-  const cL = mkCurve(left, tl, bl), cR = mkCurve(right, tr, br);
+  const cL = null, cR = null; // 책 좌우 변은 직선 고정 (도메인 지식)
   const curves = (cT || cB || cL || cR) ? {
     top: cT || sampleLine(tl, tr, CURVE_SAMPLES),
     bottom: cB || sampleLine(bl, br, CURVE_SAMPLES),
