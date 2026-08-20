@@ -130,7 +130,77 @@ async function initCV() {
 
 /* ============================================================
    문서 테두리 자동 감지 (요구 6 — 자동)
+   다단계 자체 감지: Canny 강/약 + Otsu 폴백 → 볼록 사각형 근사
    ============================================================ */
+function orderQuad(pts) {
+  const bySum = [...pts].sort((a, b) => (a.x + a.y) - (b.x + b.y));
+  const byDiff = [...pts].sort((a, b) => (a.x - a.y) - (b.x - b.y));
+  return { tl: bySum[0], br: bySum[3], bl: byDiff[0], tr: byDiff[3] };
+}
+
+/* 이진 엣지 맵에서 가장 큰 볼록 사각형을 찾는다 */
+function scanQuads(binMat, imgArea, minRatio) {
+  let best = null, bestArea = 0;
+  const contours = new cv.MatVector();
+  const hier = new cv.Mat();
+  cv.findContours(binMat, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+  for (let i = 0; i < contours.size(); i++) {
+    const cnt = contours.get(i);
+    const area = cv.contourArea(cnt);
+    if (area < imgArea * minRatio || area <= bestArea) { cnt.delete(); continue; }
+    const peri = cv.arcLength(cnt, true);
+    const approx = new cv.Mat();
+    cv.approxPolyDP(cnt, approx, 0.03 * peri, true);
+    if (approx.rows === 4 && cv.isContourConvex(approx)) {
+      const pts = [];
+      for (let j = 0; j < 4; j++) pts.push({ x: approx.data32S[j * 2], y: approx.data32S[j * 2 + 1] });
+      best = orderQuad(pts);
+      bestArea = area;
+    }
+    approx.delete();
+    cnt.delete();
+  }
+  contours.delete();
+  hier.delete();
+  return best;
+}
+
+/* 캔버스에서 문서 사각형 감지 → {tl,tr,br,bl} (캔버스 좌표) 또는 null */
+function findDocQuad(canvas, minRatio = 0.15) {
+  const src = cv.imread(canvas);
+  const imgArea = src.cols * src.rows;
+  const gray = new cv.Mat();
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+  const blur = new cv.Mat();
+  cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
+  const bin = new cv.Mat();
+  const kernel = cv.Mat.ones(3, 3, cv.CV_8U);
+  let best = null;
+  try {
+    // 1차: 표준 엣지
+    cv.Canny(blur, bin, 60, 180);
+    cv.dilate(bin, bin, kernel, new cv.Point(-1, -1), 2);
+    best = scanQuads(bin, imgArea, minRatio);
+    // 2차: 저대비(책상과 종이 색이 비슷할 때)
+    if (!best) {
+      cv.Canny(blur, bin, 20, 70);
+      cv.dilate(bin, bin, kernel, new cv.Point(-1, -1), 2);
+      best = scanQuads(bin, imgArea, minRatio);
+    }
+    // 3차: 밝기 이진화 폴백(밝은 종이 + 어두운 배경)
+    if (!best) {
+      cv.threshold(blur, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+      cv.erode(bin, bin, kernel, new cv.Point(-1, -1), 1);
+      cv.dilate(bin, bin, kernel, new cv.Point(-1, -1), 2);
+      best = scanQuads(bin, imgArea, minRatio);
+    }
+  } catch (e) {
+    console.warn('findDocQuad 실패', e);
+  }
+  src.delete(); gray.delete(); blur.delete(); bin.delete(); kernel.delete();
+  return best;
+}
+
 async function detectCorners(page) {
   page.autoChecked = true;
   if (!state.cvReady) return;
@@ -143,27 +213,33 @@ async function detectCorners(page) {
     c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
     bmp.close();
 
-    const img = cv.imread(c);
-    const contour = state.scanner.findPaperContour(img);
-    let corners = null;
-    if (contour) {
-      const cp = state.scanner.getCornerPoints(contour);
-      if (cp && cp.topLeftCorner && cp.topRightCorner && cp.bottomLeftCorner && cp.bottomRightCorner) {
-        corners = {
-          tl: { x: cp.topLeftCorner.x / scale, y: cp.topLeftCorner.y / scale },
-          tr: { x: cp.topRightCorner.x / scale, y: cp.topRightCorner.y / scale },
-          br: { x: cp.bottomRightCorner.x / scale, y: cp.bottomRightCorner.y / scale },
-          bl: { x: cp.bottomLeftCorner.x / scale, y: cp.bottomLeftCorner.y / scale },
-        };
-        // 감지 영역이 너무 작으면(전체의 12% 미만) 오감지로 보고 무시
-        const area = quadArea(corners) * scale * scale;
-        if (area < c.width * c.height * 0.12) corners = null;
+    let corners = findDocQuad(c, 0.15);
+
+    // 최후 폴백: jscanify 기본 감지
+    if (!corners) {
+      const img = cv.imread(c);
+      const contour = state.scanner.findPaperContour(img);
+      if (contour) {
+        const cp = state.scanner.getCornerPoints(contour);
+        if (cp && cp.topLeftCorner && cp.topRightCorner && cp.bottomLeftCorner && cp.bottomRightCorner) {
+          const q = {
+            tl: cp.topLeftCorner, tr: cp.topRightCorner,
+            br: cp.bottomRightCorner, bl: cp.bottomLeftCorner,
+          };
+          if (quadArea(q) >= c.width * c.height * 0.15) corners = q;
+        }
+        contour.delete();
       }
-      contour.delete();
+      img.delete();
     }
-    img.delete();
+
     if (corners) {
-      page.corners = corners;
+      page.corners = {
+        tl: { x: corners.tl.x / scale, y: corners.tl.y / scale },
+        tr: { x: corners.tr.x / scale, y: corners.tr.y / scale },
+        br: { x: corners.br.x / scale, y: corners.br.y / scale },
+        bl: { x: corners.bl.x / scale, y: corners.bl.y / scale },
+      };
       page.thumbDirty = true;
     }
     persistPage(page);
@@ -295,25 +371,40 @@ function applyFilter(canvas, filter, bright = 0, contrast = 0) {
   ctx.putImageData(im, 0, 0);
 }
 
-/* 매직컬러: 채널별 2~98퍼센타일 스트레칭 — 그림자 옅게, 종이 하얗게 */
+/* 매직컬러: 종이 흰색 기준 화이트밸런스 + 전 채널 공통 대비 곡선
+   (채널별 독립 스트레칭은 색조가 왜곡되므로 사용하지 않음) */
 function magicLUTApply(d) {
   const histR = new Uint32Array(256), histG = new Uint32Array(256), histB = new Uint32Array(256);
   let n = 0;
   for (let i = 0; i < d.length; i += 16) { histR[d[i]]++; histG[d[i + 1]]++; histB[d[i + 2]]++; n++; }
-  const lut = (hist) => {
-    const lo = percentile(hist, n, 0.02), hi = percentile(hist, n, 0.985);
-    const range = Math.max(1, hi - lo);
-    const t = new Uint8ClampedArray(256);
-    for (let v = 0; v < 256; v++) {
-      let x = (v - lo) / range;
-      x = Math.pow(Math.max(0, Math.min(1, x)), 0.92); // 살짝 밝게(감마)
-      t[v] = x * 255;
-    }
-    return t;
+
+  // 1) 종이(배경) 색 추정: 채널별 상위 97퍼센타일 → 종이가 순백이 되는 게인
+  const gain = (hist) => Math.min(1.7, Math.max(0.9, 245 / Math.max(90, percentile(hist, n, 0.97))));
+  const gR = gain(histR), gG = gain(histG), gB = gain(histB);
+
+  // 2) 화이트밸런스 적용 후 밝기 분포에서 섀도 컷 지점(하위 2.5%) 계산
+  const histL = new Uint32Array(256);
+  for (let i = 0; i < d.length; i += 16) {
+    const l = Math.min(255, 0.299 * d[i] * gR + 0.587 * d[i + 1] * gG + 0.114 * d[i + 2] * gB) | 0;
+    histL[l]++;
+  }
+  const lo = Math.min(120, percentile(histL, n, 0.025));
+
+  // 3) 모든 채널에 같은 곡선 적용 → 색조 유지, 종이만 하얗게·글자는 진하게
+  const range = Math.max(24, 246 - lo);
+  const curve = (v) => {
+    let x = (v - lo) / range;
+    x = Math.max(0, Math.min(1, x));
+    return Math.pow(x, 0.95) * 255;
   };
-  const lr = lut(histR), lg = lut(histG), lb = lut(histB);
+  const lutR = new Uint8ClampedArray(256), lutG = new Uint8ClampedArray(256), lutB = new Uint8ClampedArray(256);
+  for (let v = 0; v < 256; v++) {
+    lutR[v] = curve(Math.min(255, v * gR));
+    lutG[v] = curve(Math.min(255, v * gG));
+    lutB[v] = curve(Math.min(255, v * gB));
+  }
   for (let i = 0; i < d.length; i += 4) {
-    d[i] = lr[d[i]]; d[i + 1] = lg[d[i + 1]]; d[i + 2] = lb[d[i + 2]];
+    d[i] = lutR[d[i]]; d[i + 1] = lutG[d[i + 1]]; d[i + 2] = lutB[d[i + 2]];
   }
 }
 
@@ -419,47 +510,83 @@ function stopCamera() {
   }
 }
 
-/* 실시간 문서 감지 오버레이 */
+/* 실시간 문서 감지 오버레이 — 시간 평활(EMA)로 떨림 억제 + 안정 상태 표시 */
+const liveDetect = { quad: null, hitStreak: 0, missStreak: 0 };
+
 function startLiveOverlay() {
   const overlay = $('cam-overlay');
   const video = $('cam');
+  const hint = $('detect-hint');
   const work = document.createElement('canvas');
   setInterval(() => {
     if (!state.cvReady || !state.stream || state.screen !== 'capture' || !video.videoWidth) return;
     try {
       const vw = video.videoWidth, vh = video.videoHeight;
-      const s = 280 / Math.max(vw, vh);
+      const s = 360 / Math.max(vw, vh);
       work.width = Math.round(vw * s); work.height = Math.round(vh * s);
       work.getContext('2d').drawImage(video, 0, 0, work.width, work.height);
-      const img = cv.imread(work);
-      const contour = state.scanner.findPaperContour(img);
+
+      const found = findDocQuad(work, 0.15);
+      if (found) {
+        liveDetect.hitStreak++;
+        liveDetect.missStreak = 0;
+        // EMA 평활: 이전 위치와 60:40 혼합 → 안내선 떨림 억제
+        if (liveDetect.quad) {
+          const a = 0.4;
+          for (const k of ['tl', 'tr', 'br', 'bl']) {
+            liveDetect.quad[k].x += (found[k].x - liveDetect.quad[k].x) * a;
+            liveDetect.quad[k].y += (found[k].y - liveDetect.quad[k].y) * a;
+          }
+        } else {
+          liveDetect.quad = found;
+        }
+      } else {
+        liveDetect.hitStreak = 0;
+        liveDetect.missStreak++;
+        if (liveDetect.missStreak >= 3) liveDetect.quad = null; // 잠깐 놓친 건 유지
+      }
+
       const cw = overlay.clientWidth, ch = overlay.clientHeight;
       overlay.width = cw; overlay.height = ch;
       const octx = overlay.getContext('2d');
       octx.clearRect(0, 0, cw, ch);
-      if (contour) {
-        const cp = state.scanner.getCornerPoints(contour);
-        contour.delete();
-        if (cp && cp.topLeftCorner) {
-          // object-fit: cover 좌표 변환
-          const cover = Math.max(cw / vw, ch / vh);
-          const ox = (cw - vw * cover) / 2, oy = (ch - vh * cover) / 2;
-          const map = (p) => [ (p.x / s) * cover + ox, (p.y / s) * cover + oy ];
-          const pts = [cp.topLeftCorner, cp.topRightCorner, cp.bottomRightCorner, cp.bottomLeftCorner].map(map);
+
+      const stable = liveDetect.quad && liveDetect.hitStreak >= 2;
+      if (liveDetect.quad) {
+        // object-fit: cover 좌표 변환
+        const cover = Math.max(cw / vw, ch / vh);
+        const ox = (cw - vw * cover) / 2, oy = (ch - vh * cover) / 2;
+        const map = (p) => [(p.x / s) * cover + ox, (p.y / s) * cover + oy];
+        const pts = ['tl', 'tr', 'br', 'bl'].map((k) => map(liveDetect.quad[k]));
+        const color = stable ? 'rgba(74, 222, 128, 0.95)' : 'rgba(74, 222, 128, 0.45)';
+        octx.beginPath();
+        octx.moveTo(pts[0][0], pts[0][1]);
+        for (let i = 1; i < 4; i++) octx.lineTo(pts[i][0], pts[i][1]);
+        octx.closePath();
+        octx.fillStyle = stable ? 'rgba(74, 222, 128, 0.10)' : 'rgba(74, 222, 128, 0.04)';
+        octx.strokeStyle = color;
+        octx.lineWidth = 2.5;
+        octx.fill();
+        octx.stroke();
+        // 모서리 점
+        octx.fillStyle = color;
+        for (const [x, y] of pts) {
           octx.beginPath();
-          octx.moveTo(pts[0][0], pts[0][1]);
-          for (let i = 1; i < 4; i++) octx.lineTo(pts[i][0], pts[i][1]);
-          octx.closePath();
-          octx.fillStyle = 'rgba(74, 222, 128, 0.10)';
-          octx.strokeStyle = 'rgba(74, 222, 128, 0.9)';
-          octx.lineWidth = 2.5;
+          octx.arc(x, y, 5, 0, Math.PI * 2);
           octx.fill();
-          octx.stroke();
         }
       }
-      img.delete();
+      if (hint) {
+        if (stable) {
+          hint.textContent = '문서 인식됨 — 촬영하세요';
+          hint.className = 'detect-hint ok';
+        } else {
+          hint.textContent = '문서를 화면에 맞춰 주세요';
+          hint.className = 'detect-hint';
+        }
+      }
     } catch (e) { /* 프레임 스킵 */ }
-  }, 320);
+  }, 350);
 }
 
 /* 촬영 */
@@ -577,12 +704,24 @@ function show(screen) {
    ============================================================ */
 async function ensureThumb(page) {
   if (page.thumbUrl && !page.thumbDirty) return page.thumbUrl;
-  const canvas = await processPage(page, THUMB_MAX_SIDE);
-  const blob = await new Promise((res) => canvas.toBlob(res, 'image/jpeg', 0.8));
-  if (page.thumbUrl) URL.revokeObjectURL(page.thumbUrl);
-  page.thumbUrl = URL.createObjectURL(blob);
-  page.thumbDirty = false;
-  return page.thumbUrl;
+  // 동시 호출 시 같은 작업을 공유 — 중복 생성으로 사용 중인 URL이 무효화되는 잔상 버그 방지
+  if (page._thumbJob) return page._thumbJob;
+  page._thumbJob = (async () => {
+    try {
+      do {
+        page.thumbDirty = false;
+        const canvas = await processPage(page, THUMB_MAX_SIDE);
+        const blob = await new Promise((res) => canvas.toBlob(res, 'image/jpeg', 0.8));
+        const old = page.thumbUrl;
+        page.thumbUrl = URL.createObjectURL(blob);
+        if (old) URL.revokeObjectURL(old);
+      } while (page.thumbDirty); // 생성 도중 설정이 바뀌었으면 한 번 더
+      return page.thumbUrl;
+    } finally {
+      page._thumbJob = null;
+    }
+  })();
+  return page._thumbJob;
 }
 
 function renderGallery() {
@@ -607,6 +746,10 @@ function renderGallery() {
       img.src = url;
       item.querySelector('.gal-spin')?.remove();
       item.prepend(img);
+    }).catch(() => {
+      // 실패해도 스피너가 영원히 돌지 않게 처리
+      const spin = item.querySelector('.gal-spin');
+      if (spin) spin.innerHTML = '<span style="color:var(--text-dim);font-size:11px;">오류</span>';
     });
   });
   updateSelectBar();
@@ -1182,6 +1325,24 @@ function bindEvents() {
   });
   $('pdf-modal').addEventListener('click', (e) => { if (e.target === $('pdf-modal')) closePdfModal(); });
 
+  // 좌우 스와이프로 촬영(1) ↔ 페이지(2) 화면 전환
+  let navX = null, navY = null;
+  const navZone = $('main');
+  navZone.addEventListener('touchstart', (e) => {
+    if (e.touches.length !== 1) { navX = null; return; }
+    navX = e.touches[0].clientX;
+    navY = e.touches[0].clientY;
+  }, { passive: true });
+  navZone.addEventListener('touchend', (e) => {
+    if (navX === null || !e.changedTouches.length) return;
+    const dx = e.changedTouches[0].clientX - navX;
+    const dy = e.changedTouches[0].clientY - navY;
+    navX = null;
+    if (Math.abs(dx) < 70 || Math.abs(dy) > 60) return;
+    if (state.screen === 'capture' && dx < 0 && state.pages.length) show('gallery');
+    else if (state.screen === 'gallery' && dx > 0 && !state.selectMode) show('capture');
+  }, { passive: true });
+
   // 화면 꺼짐/전환 시 카메라 정리
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) stopCamera();
@@ -1196,7 +1357,7 @@ async function init() {
   startLiveOverlay();
   initCV(); // 백그라운드 — UI를 막지 않음
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('sw.js?v=1.0.1').catch(() => {});
+    navigator.serviceWorker.register('sw.js?v=1.0.2').catch(() => {});
   }
 }
 

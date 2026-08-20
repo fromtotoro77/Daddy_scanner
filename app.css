@@ -295,6 +295,30 @@ main {
   box-shadow: 0 0 8px rgba(244, 63, 94, 0.6);
 }
 
+/* 실시간 감지 상태 안내 */
+.detect-hint {
+  position: absolute;
+  bottom: 0.9rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 3;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  background: rgba(12, 12, 14, 0.6);
+  backdrop-filter: blur(6px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  padding: 6px 14px;
+  transition: color 0.25s, border-color 0.25s;
+}
+.detect-hint.ok {
+  color: #4ade80;
+  border-color: rgba(74, 222, 128, 0.35);
+}
+
 /* 촬영 플래시 효과 */
 .flash { animation: flash-anim 0.28s ease-out; }
 @keyframes flash-anim { 0% { opacity: 1; } 100% { opacity: 0; } }
