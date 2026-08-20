@@ -1356,9 +1356,27 @@ async function init() {
   show('capture');
   startLiveOverlay();
   initCV(); // 백그라운드 — UI를 막지 않음
-  if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('sw.js?v=1.0.2').catch(() => {});
-  }
+  initServiceWorker();
+}
+
+/* 새 버전 자동 반영: 배포가 감지되면 안내 후 스스로 한 번 새로고침 */
+function initServiceWorker() {
+  if (!('serviceWorker' in navigator)) return;
+  const wasControlled = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.register('sw.js').then((reg) => {
+    reg.update().catch(() => {});
+    // 앱이 포그라운드로 돌아올 때마다 업데이트 확인 (PWA는 오래 떠있는 경우가 많음)
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) reg.update().catch(() => {});
+    });
+  }).catch(() => {});
+  let refreshing = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (refreshing || !wasControlled) return; // 최초 설치 시에는 새로고침 불필요
+    refreshing = true;
+    toast('새 버전으로 업데이트 중…', { type: 'success', duration: 1500 });
+    setTimeout(() => location.reload(), 700);
+  });
 }
 
 init();

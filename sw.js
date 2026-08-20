@@ -1,13 +1,13 @@
 /* Daddy Scanner Service Worker v1.0.0
    - 앱 셸: 설치 시 프리캐시
    - CDN(OpenCV.js 8MB 포함)·폰트: 첫 사용 후 캐시 우선 → 두 번째 접속부터 즉시 실행/오프라인 동작 */
-const CACHE = 'daddy-scanner-v1.0.2';
+const CACHE = 'daddy-scanner-v1.0.3';
 const SHELL = [
   './',
   './index.html',
-  './app.css?v=1.0.2',
-  './app.js?v=1.0.2',
-  './manifest.json?v=1.0.2',
+  './app.css?v=1.0.3',
+  './app.js?v=1.0.3',
+  './manifest.json?v=1.0.3',
   './icons/icon-192.png',
   './icons/icon-512.png',
 ];
@@ -52,9 +52,12 @@ self.addEventListener('fetch', (e) => {
   }
 
   // 앱 셸: 네트워크 우선, 실패 시 캐시 (배포 갱신을 바로 반영하면서 오프라인 대응)
+  // HTML 문서는 HTTP 캐시(GitHub Pages 10분)를 우회해 항상 서버에 재검증 → 새 배포 즉시 반영
   if (url.origin === location.origin) {
+    const isDoc = e.request.mode === 'navigate' || e.request.destination === 'document';
+    const req = isDoc ? new Request(e.request.url, { cache: 'no-cache' }) : e.request;
     e.respondWith(
-      fetch(e.request)
+      fetch(req)
         .then((res) => {
           const clone = res.clone();
           caches.open(CACHE).then((c) => c.put(e.request, clone));
