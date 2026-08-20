@@ -144,8 +144,9 @@ function orderQuad(pts) {
 }
 
 /* 이진 맵에서 가장 큰 볼록 사각형을 찾는다 (원시 윤곽선도 함께 반환 — 곡면 추출용)
-   maxRatio: 화면 거의 전체를 덮는 프레임 오감지 방지 */
-function scanQuads(binMat, imgArea, minRatio, maxRatio = 0.985) {
+   maxRatio: 화면 거의 전체를 덮는 프레임 오감지 방지
+   center: 지정 시 그 점을 포함하는 윤곽만 인정 — 사용자가 겨눈 중앙 우선(모니터·키보드 오감지 방지) */
+function scanQuads(binMat, imgArea, minRatio, maxRatio = 0.985, center = null) {
   let best = null, bestArea = 0, bestContour = null;
   const contours = new cv.MatVector();
   const hier = new cv.Mat();
@@ -154,6 +155,7 @@ function scanQuads(binMat, imgArea, minRatio, maxRatio = 0.985) {
     const cnt = contours.get(i);
     const area = cv.contourArea(cnt);
     if (area < imgArea * minRatio || area > imgArea * maxRatio || area <= bestArea) { cnt.delete(); continue; }
+    if (center && cv.pointPolygonTest(cnt, center, false) < 0) { cnt.delete(); continue; }
     // 곡면 페이지도 4점으로 잡히도록 근사 강도를 올려가며 시도
     const peri = cv.arcLength(cnt, true);
     let quad = null;
@@ -183,10 +185,36 @@ function scanQuads(binMat, imgArea, minRatio, maxRatio = 0.985) {
   return best ? { quad: best, contour: bestContour } : null;
 }
 
-/* 캔버스에서 문서 사각형 감지 → {tl,tr,br,bl} (캔버스 좌표) 또는 null */
+/* "종이다움" 마스크: 화면 중앙(사용자가 겨눈 지점) 색을 기준으로
+   저채도+충분히 밝은 픽셀만 남긴다 — 포스트잇·나무책상·컬러 물체 자동 배제 */
+function paperMask(srcRgba) {
+  const rgb = new cv.Mat();
+  cv.cvtColor(srcRgba, rgb, cv.COLOR_RGBA2RGB);
+  const hsv = new cv.Mat();
+  cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
+  rgb.delete();
+  const W = hsv.cols, H = hsv.rows;
+  const patch = hsv.roi(new cv.Rect((W * 0.44) | 0, (H * 0.44) | 0, Math.max(2, (W * 0.12) | 0), Math.max(2, (H * 0.12) | 0)));
+  const m = cv.mean(patch); // [h, s, v]
+  patch.delete();
+  const sRef = m[1], vRef = m[2];
+  if (sRef > 120 || vRef < 70) { hsv.delete(); return null; } // 중앙이 종이로 안 보임 → 이 방법 포기
+  const vLow = Math.max(50, vRef * 0.62);
+  const sHigh = Math.min(200, Math.max(80, sRef + 55));
+  const low = new cv.Mat(H, W, hsv.type(), new cv.Scalar(0, 0, vLow, 0));
+  const high = new cv.Mat(H, W, hsv.type(), new cv.Scalar(180, sHigh, 255, 0));
+  const mask = new cv.Mat();
+  cv.inRange(hsv, low, high, mask);
+  hsv.delete(); low.delete(); high.delete();
+  return mask;
+}
+
+/* 캔버스에서 문서 사각형 감지 → {tl,tr,br,bl} (캔버스 좌표) 또는 null
+   전략: ①종이색 마스크(중앙 기준) → ②밝기 이진화 → ③④엣지. 모두 "중앙 포함" 후보만 인정 */
 function findDocQuad(canvas, minRatio = 0.15) {
   const src = cv.imread(canvas);
   const imgArea = src.cols * src.rows;
+  const center = new cv.Point(src.cols / 2, src.rows / 2);
   const gray = new cv.Mat();
   cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
   const blur = new cv.Mat();
@@ -195,24 +223,34 @@ function findDocQuad(canvas, minRatio = 0.15) {
   const kernel = cv.Mat.ones(3, 3, cv.CV_8U);
   let best = null;
   try {
-    // 1차: 밝은 종이 영역(페이지 전체) 우선 — 페이지 안의 표·글자 블록에 낚이지 않도록.
-    // 표/글자는 종이 안쪽 내용이라 밝은 영역의 바깥 윤곽에 영향을 주지 않는다.
-    cv.threshold(blur, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
-    healHorizontalBands(bin); // 스프링 제본 등 어두운 가로 띠가 페이지를 상/하로 가르는 것 방지
-    cv.morphologyEx(bin, bin, cv.MORPH_CLOSE, kernel, new cv.Point(-1, -1), 2);
-    cv.erode(bin, bin, kernel, new cv.Point(-1, -1), 1); // 옆 페이지와의 얇은 연결 절단
-    best = scanQuads(bin, imgArea, minRatio, 0.97);
-    // 2차: 표준 엣지 (종이와 배경 밝기가 비슷할 때)
+    // 1차: 종이색 마스크 — 주변 잡동사니(밝은 물체·컬러 물체)에 가장 강함
+    const pm = paperMask(src);
+    if (pm) {
+      healHorizontalBands(pm);
+      cv.morphologyEx(pm, pm, cv.MORPH_CLOSE, kernel, new cv.Point(-1, -1), 2);
+      cv.erode(pm, pm, kernel, new cv.Point(-1, -1), 1);
+      best = scanQuads(pm, imgArea, minRatio, 0.97, center);
+      pm.delete();
+    }
+    // 2차: 밝기 이진화(Otsu) — 표/글자는 종이 안쪽이라 외곽에 영향 없음
+    if (!best) {
+      cv.threshold(blur, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+      healHorizontalBands(bin);
+      cv.morphologyEx(bin, bin, cv.MORPH_CLOSE, kernel, new cv.Point(-1, -1), 2);
+      cv.erode(bin, bin, kernel, new cv.Point(-1, -1), 1);
+      best = scanQuads(bin, imgArea, minRatio, 0.97, center);
+    }
+    // 3차: 표준 엣지 (종이와 배경 밝기가 비슷할 때)
     if (!best) {
       cv.Canny(blur, bin, 60, 180);
       cv.dilate(bin, bin, kernel, new cv.Point(-1, -1), 2);
-      best = scanQuads(bin, imgArea, minRatio);
+      best = scanQuads(bin, imgArea, minRatio, 0.985, center);
     }
-    // 3차: 저대비 엣지
+    // 4차: 저대비 엣지
     if (!best) {
       cv.Canny(blur, bin, 20, 70);
       cv.dilate(bin, bin, kernel, new cv.Point(-1, -1), 2);
-      best = scanQuads(bin, imgArea, minRatio);
+      best = scanQuads(bin, imgArea, minRatio, 0.985, center);
     }
   } catch (e) {
     console.warn('findDocQuad 실패', e);
@@ -758,33 +796,22 @@ function startLiveOverlay() {
           octx.fill();
           octx.stroke();
         }
-        // 책등(분할) 경계선 — 빨간색
-        let spineTop = null, spineBot = null;
-        if (two) {
-          const [L, R] = blobs;
-          spineTop = map({ x: (L.quad.tr.x + R.quad.tl.x) / 2, y: (L.quad.tr.y + R.quad.tl.y) / 2 });
-          spineBot = map({ x: (L.quad.br.x + R.quad.bl.x) / 2, y: (L.quad.br.y + R.quad.bl.y) / 2 });
-        } else if (blobs.length === 1) {
-          const q = blobs[0].quad;
-          spineTop = map({ x: (q.tl.x + q.tr.x) / 2, y: (q.tl.y + q.tr.y) / 2 });
-          spineBot = map({ x: (q.bl.x + q.br.x) / 2, y: (q.bl.y + q.br.y) / 2 });
-        }
-        if (spineTop) {
-          octx.beginPath();
-          octx.moveTo(spineTop[0], spineTop[1]);
-          octx.lineTo(spineBot[0], spineBot[1]);
-          octx.strokeStyle = 'rgba(244, 63, 94, 0.95)';
-          octx.lineWidth = 3;
-          octx.setLineDash([10, 7]);
-          octx.stroke();
-          octx.setLineDash([]);
-        }
+        // 고정 중앙 분할선(빨간 점선) — 사용자가 책등을 이 선에 맞추고 촬영
+        const lineX = ox + (vw * fit) / 2;
+        octx.beginPath();
+        octx.moveTo(lineX, oy);
+        octx.lineTo(lineX, oy + vh * fit);
+        octx.strokeStyle = 'rgba(244, 63, 94, 0.95)';
+        octx.lineWidth = 3;
+        octx.setLineDash([12, 8]);
+        octx.stroke();
+        octx.setLineDash([]);
         if (hint) {
           if (two) {
             hint.textContent = '펼침면 인식됨 — 촬영하면 2페이지로 분할';
             hint.className = 'detect-hint ok';
           } else {
-            hint.textContent = blobs.length ? '펼침면 인식 중…' : '펼친 책을 화면에 맞춰 주세요';
+            hint.textContent = '책등을 빨간 선에 맞추고 촬영하세요';
             hint.className = 'detect-hint';
           }
         }
@@ -917,61 +944,38 @@ function healHorizontalBands(bin) {
 }
 
 /* 펼침면에서 좌/우 페이지 블롭을 각각 감지 (책등 그림자가 두 밝은 영역을 가르는 것을 이용) */
+/* 펼침면 페이지 감지 — 중앙 고정선 방식:
+   책등 = 화면 가운데(사용자가 빨간 선에 맞춤)로 고정하고,
+   좌/우 절반에서 각각 "페이지 하나"만 찾는다 (책등 그림자 유무와 무관하게 동작) */
 function findPageBlobs(canvas) {
-  const src = cv.imread(canvas);
-  const imgArea = src.cols * src.rows;
-  const gray = new cv.Mat();
-  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-  const blur = new cv.Mat();
-  cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
-  const bin = new cv.Mat();
-  const kernel = cv.Mat.ones(3, 3, cv.CV_8U);
-  const found = [];
+  const W = canvas.width, H = canvas.height;
+  const mid = W >> 1;
+  const halfCanvas = (x0, w) => {
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = H;
+    c.getContext('2d').drawImage(canvas, x0, 0, w, H, 0, 0, w, H);
+    return c;
+  };
+  const out = [];
   try {
-    cv.threshold(blur, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
-    healHorizontalBands(bin); // 페이지를 상/하로 가르는 가로 띠 메꿈 (세로 책등 분리는 유지)
-    cv.morphologyEx(bin, bin, cv.MORPH_CLOSE, kernel, new cv.Point(-1, -1), 2);
-    cv.erode(bin, bin, kernel, new cv.Point(-1, -1), 1);
-    const contours = new cv.MatVector();
-    const hier = new cv.Mat();
-    cv.findContours(bin, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-    for (let i = 0; i < contours.size(); i++) {
-      const cnt = contours.get(i);
-      const area = cv.contourArea(cnt);
-      if (area < imgArea * 0.1 || area > imgArea * 0.85) { cnt.delete(); continue; }
-      const peri = cv.arcLength(cnt, true);
-      let quad = null;
-      for (const k of [0.02, 0.035, 0.05, 0.08]) {
-        const approx = new cv.Mat();
-        if (quad === null) {
-          cv.approxPolyDP(cnt, approx, k * peri, true);
-          if (approx.rows === 4 && cv.isContourConvex(approx)) {
-            const pts = [];
-            for (let j = 0; j < 4; j++) pts.push({ x: approx.data32S[j * 2], y: approx.data32S[j * 2 + 1] });
-            quad = orderQuad(pts);
-          }
-        }
-        approx.delete();
-      }
-      if (quad) {
-        const contour = [];
-        const d = cnt.data32S;
-        for (let j = 0; j < d.length; j += 2) contour.push({ x: d[j], y: d[j + 1] });
-        found.push({ quad, contour, area });
-      }
-      cnt.delete();
+    const L = findDocQuad(halfCanvas(0, mid), 0.18);
+    const R = findDocQuad(halfCanvas(mid, W - mid), 0.18);
+    // 페이지 안쪽 변이 중앙선 근처에 닿아 있어야 진짜 펼침면 페이지
+    if (L && Math.max(L.quad.tr.x, L.quad.br.x) > mid * 0.75) {
+      out.push({ quad: L.quad, contour: L.contour });
     }
-    contours.delete();
-    hier.delete();
+    if (R) {
+      const sh = (p) => ({ x: p.x + mid, y: p.y });
+      const q = { tl: sh(R.quad.tl), tr: sh(R.quad.tr), br: sh(R.quad.br), bl: sh(R.quad.bl) };
+      if (Math.min(q.tl.x, q.bl.x) < mid + (W - mid) * 0.25) {
+        out.push({ quad: q, contour: R.contour.map(sh) });
+      }
+    }
   } catch (e) {
     console.warn('findPageBlobs 실패', e);
   }
-  src.delete(); gray.delete(); blur.delete(); bin.delete(); kernel.delete();
-  found.sort((a, b) => b.area - a.area);
-  // 두 번째 블롭이 첫 번째의 40% 이상일 때만 "두 페이지"로 인정
-  const top = found.slice(0, 2).filter((b, i) => i === 0 || b.area >= found[0].area * 0.4);
-  top.sort((a, b) => (a.quad.tl.x + a.quad.br.x) - (b.quad.tl.x + b.quad.br.x)); // 왼쪽 → 오른쪽
-  return top;
+  return out; // 왼쪽 → 오른쪽 순
 }
 
 /* 펼침면 분할: 좌/우 페이지를 각각 보정(원근+곡면)해 2페이지로 저장 */
@@ -1020,7 +1024,26 @@ async function addSpreadPages(blob, silent) {
       rotation: 0, filter: 'original', bright: 0, contrast: 0,
     };
     await detectCorners(temp);
-    if (!temp.corners) return false;
+    if (!temp.corners) {
+      // 최후 폴백: 감지 실패 시에도 고정 중앙선 기준으로 절단
+      // (사용자가 책등을 빨간 선에 맞췄다는 전제 — 각 반쪽은 일반 감지·보정을 따로 거침)
+      const bmp2 = await createImageBitmap(blob);
+      const half = (x0, w) => {
+        const c = document.createElement('canvas');
+        c.width = w;
+        c.height = bmp2.height;
+        c.getContext('2d').drawImage(bmp2, x0, 0, w, bmp2.height, 0, 0, w, bmp2.height);
+        return new Promise((res) => c.toBlob(res, 'image/jpeg', 0.92));
+      };
+      const mid = Math.round(bmp2.width / 2);
+      const lb = await half(0, mid);
+      const rb = await half(mid, bmp2.width - mid);
+      bmp2.close();
+      await addPage(lb, true);
+      await addPage(rb, true);
+      if (!silent) toast('가운데 선 기준으로 2페이지 분할됨', { duration: 1800 });
+      return true;
+    }
     const canvas = await processPage(temp, CAPTURE_MAX_SIDE);
     if (canvas.width < 200) return false;
     // 보정 결과가 세로형이면 펼침면이 아니라 한 페이지 → 자르지 않고 그대로 저장
