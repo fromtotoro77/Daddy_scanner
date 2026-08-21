@@ -117,6 +117,7 @@ function pmScore(P, fieldObj, W, H, guide) {
     const rw = (guide && guide.rowW !== undefined) ? guide.rowW : pmFlag('PM_ROW_W');
     if (rw) s += rw * pmRowScore(P, fieldObj.gray, W, H); // 글줄 수평 (자세·F 모호성 해소)
   }
+  if (fieldObj.textLines && fieldObj.textW) s += fieldObj.textW * pmTextLineScore(P, fieldObj.textLines, W, H, fieldObj.useMargin);
   return s;
 }
 
@@ -476,6 +477,184 @@ function pmFitTextFirst(field, W, H, anchorC, P0, rowW = 300) {
     if (r.score > cur.score) cur = r;
   }
   return cur.P;
+}
+
+/* ===== 글줄 곡선 기반 평탄화 (사용자 원칙: 글자가 기준, 안내선은 틀) ===== */
+
+/* 글줄 추출: 적응 이진화 → 가로로 이어붙여 줄 덩어리 → 연결요소 → 줄마다 중심선 점열.
+   반환 { lines: [[{x,y},...], ...], starts: [{x,y},...](좌측 시작점) } — 감지 캔버스 좌표 */
+function pmExtractTextLines(grayMat, W, H) {
+  const bin = new cv.Mat();
+  cv.adaptiveThreshold(grayMat, bin, 255, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY_INV, 25, 15);
+  // 글자 → 단어 → 줄: 가로 긴 커널로 닫기 (세로는 얇게 유지해 윗줄과 안 붙게)
+  const kw = Math.max(9, Math.round(W * 0.022));
+  const k = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(kw, 3));
+  const merged = new cv.Mat();
+  cv.morphologyEx(bin, merged, cv.MORPH_CLOSE, k);
+  const k2 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+  cv.morphologyEx(merged, merged, cv.MORPH_OPEN, k2); // 점잡음 제거
+  const labels = new cv.Mat(), stats = new cv.Mat(), cents = new cv.Mat();
+  const n = cv.connectedComponentsWithStats(merged, labels, stats, cents, 8, cv.CV_32S);
+  const lab = labels.data32S;
+  const lines = [];
+  for (let i = 1; i < n; i++) {
+    const x = stats.intAt(i, cv.CC_STAT_LEFT), y = stats.intAt(i, cv.CC_STAT_TOP);
+    const w = stats.intAt(i, cv.CC_STAT_WIDTH), h = stats.intAt(i, cv.CC_STAT_HEIGHT);
+    if (w < W * 0.12 || h < H * 0.004 || h > H * 0.035 || w / h < 5) continue;
+    // 열 샘플마다 전경 픽셀의 평균 y = 중심선
+    const pts = [];
+    const step = Math.max(3, Math.round(w / 24));
+    for (let cx = x; cx < x + w; cx += step) {
+      let sy = 0, c = 0;
+      for (let cy = y; cy < y + h; cy++) if (lab[cy * W + cx] === i) { sy += cy; c++; }
+      if (c) pts.push({ x: cx, y: sy / c });
+    }
+    if (pts.length >= 8) lines.push({ pts, x0: x, x1: x + w, y: y + h / 2, h });
+  }
+  // 좌측 정렬선: 줄 시작 x의 하위 군집(들여쓰기·짧은 줄 제외)
+  const xs = lines.map((l) => l.x0).sort((a, b) => a - b);
+  const starts = [];
+  if (xs.length >= 4) {
+    const ref = xs[Math.floor(xs.length * 0.25)];
+    for (const l of lines) if (Math.abs(l.x0 - ref) < W * 0.03) starts.push({ x: l.x0, y: l.y });
+  }
+  bin.delete(); merged.delete(); k.delete(); k2.delete(); labels.delete(); stats.delete(); cents.delete();
+  return { lines: lines.map((l) => l.pts), starts, lineHeight: lines.length ? lines.reduce((a, l) => a + l.h, 0) / lines.length : 0 };
+}
+
+/* 화면점 → 모델 (u,v) 역투영: 모서리 호모그래피 근사로 시작해 뉴턴 3회 */
+function pmInverse(P, W, H, x, y, seedH) {
+  let u, v;
+  {
+    const d = seedH[6] * x + seedH[7] * y + seedH[8];
+    u = (seedH[0] * x + seedH[1] * y + seedH[2]) / d;
+    v = (seedH[3] * x + seedH[4] * y + seedH[5]) / d;
+  }
+  const h = 1e-3;
+  for (let it = 0; it < 3; it++) {
+    const p = pmProject(P, u, v, W, H); if (!p) return null;
+    const pu = pmProject(P, u + h, v, W, H), pv = pmProject(P, u, v + h, W, H); if (!pu || !pv) return null;
+    const a = (pu[0] - p[0]) / h, b = (pv[0] - p[0]) / h, c = (pu[1] - p[1]) / h, d = (pv[1] - p[1]) / h;
+    const det = a * d - b * c; if (Math.abs(det) < 1e-9) break;
+    const ex = x - p[0], ey = y - p[1];
+    u += (d * ex - b * ey) / det; v += (-c * ex + a * ey) / det;
+  }
+  return [u, v];
+}
+
+/* 글줄 정합 점수: 각 글줄의 점들이 펴진 종이에서 같은 높이(v)에 놓여야 한다 →
+   줄마다 v의 표준편차(페이지 높이 대비)를 벌점. 좌측 정렬선은 같은 u(옵션 useMargin).
+   단위: 펴진 페이지 1000px 기준 px */
+function pmTextLineScore(P, text, W, H, useMargin) {
+  const c = [pmProject(P, 0, 0, W, H), pmProject(P, 1, 0, W, H), pmProject(P, 1, 1, W, H), pmProject(P, 0, 1, W, H)];
+  if (c.some((p) => !p)) return -1e9;
+  const seedH = pmHomography4(c.map((p) => [p[0], p[1]]), [[0, 0], [1, 0], [1, 1], [0, 1]]);
+  if (!seedH) return -1e9;
+  let pen = 0, nl = 0;
+  for (const line of text.lines) {
+    const vs = [];
+    for (const q of line) { const uv = pmInverse(P, W, H, q.x, q.y, seedH); if (uv) vs.push(uv[1]); }
+    if (vs.length < 6) continue;
+    const m = vs.reduce((a, b) => a + b, 0) / vs.length;
+    const sd = Math.sqrt(vs.reduce((a, b) => a + (b - m) * (b - m), 0) / vs.length);
+    pen += Math.min(sd * 1000, 60); nl++;  // 이상 줄(그림·표) 영향 상한
+  }
+  if (!nl) return 0;
+  let s = -pen / nl;
+  if (useMargin && text.starts.length >= 4) {
+    const us = [];
+    for (const q of text.starts) { const uv = pmInverse(P, W, H, q.x, q.y, seedH); if (uv) us.push(uv[0]); }
+    if (us.length >= 4) {
+      const m = us.reduce((a, b) => a + b, 0) / us.length;
+      const sd = Math.sqrt(us.reduce((a, b) => a + (b - m) * (b - m), 0) / us.length);
+      s -= 0.7 * Math.min(sd * 1000, 60);
+    }
+  }
+  return s;
+}
+
+/* 글줄 기반 2단계: 1단계 외곽을 느슨히 잡고(여유 slack, 강도 wPts) 글줄 정합으로 자세 결정 */
+function pmRefineByTextLines(field, W, H, P1, text, opts) {
+  opts = opts || {};
+  const w = opts.w === undefined ? 8 : opts.w, slack = opts.slack === undefined ? 0.008 : opts.slack;
+  const wPts = opts.wPts === undefined ? 20 : opts.wPts, useMargin = opts.useMargin === undefined ? true : opts.useMargin;
+  const base = { anchorPts: pmOutline(P1, W, H), slackPts: slack * Math.max(W, H), wPts, rowW: 0 };
+  const fieldT = { dist: field.dist, gray: field.gray, soft: field.soft, textLines: text, textW: w, useMargin };
+  let cur = { P: { ...P1 }, score: pmScore(P1, fieldT, W, H, base) };
+  for (const sc of [0.5, 0.2, 0.08]) {
+    const r = pmFit(fieldT, W, H, base, cur.P, sc);
+    if (r.score > cur.score) cur = r;
+  }
+  return cur.P;
+}
+
+/* 3단계 글자 직교화(사용자 원칙 "글자가 평평한 종이 위 글자로 보여야"):
+   모델로 편 결과에서 글줄을 다시 추출 → 각 줄을 자기 평균 높이로 끌어 맞추는 세로 변위장
+   (줄 사이는 세로 보간, 줄 안은 가로 보간) → 리맵. 줄은 정의상 수평이 된다.
+   useMargin이면 좌측 정렬선(줄 시작점)도 같은 x로 끌어 수직화.
+   반환: { mapX, mapY(Float32Array), nLines, maxShift } 또는 null(글줄 부족) */
+function pmTextRectifyMaps(grayMat, w, h, useMargin) {
+  const text = pmExtractTextLines(grayMat, w, h);
+  if (text.lines.length < 4) return null;
+  // 줄별: 평균 y, x→편차 테이블 (이동평균 5로 평활)
+  const L = [];
+  for (const pts of text.lines) {
+    const ys = pts.map((p) => p.y);
+    const m = ys.reduce((a, b) => a + b, 0) / ys.length;
+    const dev = pts.map((p, i) => {
+      let s = 0, c = 0;
+      for (let k = -2; k <= 2; k++) { const j = i + k; if (j >= 0 && j < pts.length) { s += pts[j].y - m; c++; } }
+      return s / c;
+    });
+    L.push({ m, xs: pts.map((p) => p.x), dev });
+  }
+  L.sort((a, b) => a.m - b.m);
+  const devAt = (ln, x) => { // 줄 안 가로 선형 보간, 밖은 끝값 유지
+    const xs = ln.xs, d = ln.dev;
+    if (x <= xs[0]) return d[0];
+    if (x >= xs[xs.length - 1]) return d[d.length - 1];
+    let i = 1; while (xs[i] < x) i++;
+    const t = (x - xs[i - 1]) / (xs[i] - xs[i - 1]);
+    return d[i - 1] + t * (d[i] - d[i - 1]);
+  };
+  // 세로 변위 dy(x,y): 줄 사이 선형 보간, 첫 줄 위/마지막 줄 아래는 끝 줄 값
+  const mapX = new Float32Array(w * h), mapY = new Float32Array(w * h);
+  let maxShift = 0;
+  // 좌측 정렬선 수평 변위 dx(y)
+  let starts = null;
+  if (useMargin && text.starts.length >= 4) {
+    starts = text.starts.slice().sort((a, b) => a.y - b.y);
+    const mx = starts.reduce((a, s) => a + s.x, 0) / starts.length;
+    starts = starts.map((s) => ({ y: s.y, d: s.x - mx }));
+  }
+  const dxAt = (y) => {
+    if (!starts) return 0;
+    if (y <= starts[0].y) return starts[0].d;
+    if (y >= starts[starts.length - 1].y) return starts[starts.length - 1].d;
+    let i = 1; while (starts[i].y < y) i++;
+    const t = (y - starts[i - 1].y) / (starts[i].y - starts[i - 1].y);
+    return starts[i - 1].d + t * (starts[i].d - starts[i - 1].d);
+  };
+  const colDev = new Float32Array(L.length);
+  for (let x = 0; x < w; x++) {
+    for (let i = 0; i < L.length; i++) colDev[i] = devAt(L[i], x);
+    let li = 0;
+    for (let y = 0; y < h; y++) {
+      let d;
+      if (y <= L[0].m) d = colDev[0];
+      else if (y >= L[L.length - 1].m) d = colDev[L.length - 1];
+      else {
+        while (L[li + 1].m < y) li++;
+        const t = (y - L[li].m) / (L[li + 1].m - L[li].m);
+        d = colDev[li] + t * (colDev[li + 1] - colDev[li]);
+      }
+      const dx = dxAt(y);
+      mapY[y * w + x] = y + d;   // 출력 y에 있어야 할 글줄은 입력에서 y+d에 있었다
+      mapX[y * w + x] = x + dx;
+      const a = Math.abs(d); if (a > maxShift) maxShift = a;
+    }
+  }
+  return { mapX, mapY, nLines: L.length, maxShift, nStarts: starts ? starts.length : 0 };
 }
 
 /* 펴진 페이지의 실제 가로/세로 비율: 중간 행 단면 호길이 × pw / ph

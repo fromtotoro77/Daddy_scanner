@@ -105,8 +105,15 @@ JS = """async (arg) => {
     src2raw.width = W; src2raw.height = H;
     src2raw.getContext('2d').drawImage(im, 0, 0, W, H);
     const src2 = cv.imread(src2raw);
-    const dst = new cv.Mat();
+    let dst = new cv.Mat();
     cv.remap(src2, dst, mX, mY, cv.INTER_LINEAR, cv.BORDER_REPLICATE);
+    // 3단계 글자 직교화
+    { const g0 = new cv.Mat(); cv.cvtColor(dst, g0, cv.COLOR_RGBA2GRAY);
+      const rmt = pmTextRectifyMaps(g0, outW, outH, true); g0.delete();
+      if (rmt) { const mXr = cv.matFromArray(outH, outW, cv.CV_32FC1, Array.from(rmt.mapX));
+                 const mYr = cv.matFromArray(outH, outW, cv.CV_32FC1, Array.from(rmt.mapY));
+                 const d2 = new cv.Mat(); cv.remap(dst, d2, mXr, mYr, cv.INTER_LINEAR, cv.BORDER_REPLICATE);
+                 dst.delete(); mXr.delete(); mYr.delete(); dst = d2; } }
     // 테두리 배경 띠 제거
     const gF = new cv.Mat(); cv.cvtColor(dst, gF, cv.COLOR_RGBA2GRAY);
     const tb = pmTrimDarkBorders(gF.data, outW, outH); gF.delete();
@@ -159,5 +166,5 @@ W = max(r.width for r in rows); H = sum(r.height for r in rows) + 12 * len(rows)
 s = Image.new('RGB', (W, H), (12, 12, 14)); y = 0
 for r in rows:
     s.paste(r, (0, y)); y += r.height + 12
-s.save('C:/python_work/test_photos/trustfit_v11_final.jpg', quality=88)
+s.save('C:/python_work/test_photos/trustfit_v12_rectify.jpg', quality=88)
 print('sheet saved')

@@ -96,6 +96,7 @@ JS = """async (arg) => {
       for (let i = 0; i < W * H; i++) softArr[i] = Math.min(1, softArr[i] / ref); }
     bb.delete(); gx.delete(); gy.delete();
     const field = { dist: new Float32Array(distM.data32F), gray: new Uint8Array(blur2.data), soft: softArr };
+    const textInfo = pmExtractTextLines(gray, W, H);
     src.delete(); gray.delete(); blur2.delete(); edges.delete(); clean.delete(); inv.delete(); distM.delete();
 
     const guides = [
@@ -142,7 +143,7 @@ JS = """async (arg) => {
     });
     const initErr = evalOutline(line0(P0, 0), line0(P0, 1), side0(P0, 0), side0(P0, 1));
     const r3x = pmFitMulti(field, W, H, gtGuide, P0);
-    const P3 = (window.PM_TEXT_FIRST) ? pmFitTextFirst(field, W, H, gtC, P0, window.PM_TEXT_FIRST) : (window.PM_ROW_W2 > 0) ? pmRefineInterior(field, W, H, r3x.P, window.PM_ROW_W2, window.PM_ROW_SLACK || 0.006, window.PM_ROW_WPTS || 20) : r3x.P;
+    const P3 = (window.PM_TL_W > 0 && textInfo.lines.length >= 4) ? pmRefineByTextLines(field, W, H, r3x.P, textInfo, { w: window.PM_TL_W, slack: window.PM_ROW_SLACK || 0.008, wPts: window.PM_ROW_WPTS || 20 }) : (window.PM_TEXT_FIRST) ? pmFitTextFirst(field, W, H, gtC, P0, window.PM_TEXT_FIRST) : (window.PM_ROW_W2 > 0) ? pmRefineInterior(field, W, H, r3x.P, window.PM_ROW_W2, window.PM_ROW_SLACK || 0.006, window.PM_ROW_WPTS || 20) : r3x.P;
     const oracleErr = evalOutline(line0(P3, 0), line0(P3, 1), side0(P3, 0), side0(P3, 1));
     // 변별 오차 분해
     const edgeErr = {};
@@ -159,9 +160,22 @@ JS = """async (arg) => {
     const rm2 = pmBuildRemap(P3, W, H, outW2, outH2);
     const mX2 = cv.matFromArray(outH2, outW2, cv.CV_32FC1, Array.from(rm2.mapX));
     const mY2 = cv.matFromArray(outH2, outW2, cv.CV_32FC1, Array.from(rm2.mapY));
-    const srcF = cv.imread(dc); const dstF = new cv.Mat();
+    const srcF = cv.imread(dc); let dstF = new cv.Mat();
     cv.remap(srcF, dstF, mX2, mY2, cv.INTER_LINEAR, cv.BORDER_REPLICATE);
-    const gF = new cv.Mat(); cv.cvtColor(dstF, gF, cv.COLOR_RGBA2GRAY);
+    let gF = new cv.Mat(); cv.cvtColor(dstF, gF, cv.COLOR_RGBA2GRAY);
+    let rectInfo = null;
+    if (window.PM_RECT) {
+        const rm = pmTextRectifyMaps(gF, outW2, outH2, window.PM_RECT_MARGIN !== false);
+        if (rm) {
+            const mXr = cv.matFromArray(outH2, outW2, cv.CV_32FC1, Array.from(rm.mapX));
+            const mYr = cv.matFromArray(outH2, outW2, cv.CV_32FC1, Array.from(rm.mapY));
+            const d2 = new cv.Mat(); cv.remap(dstF, d2, mXr, mYr, cv.INTER_LINEAR, cv.BORDER_REPLICATE);
+            dstF.delete(); mXr.delete(); mYr.delete();
+            dstF = d2;
+            gF.delete(); gF = new cv.Mat(); cv.cvtColor(dstF, gF, cv.COLOR_RGBA2GRAY);
+            rectInfo = { nLines: rm.nLines, maxShift: +rm.maxShift.toFixed(1), nStarts: rm.nStarts };
+        }
+    }
     const gd = gF.data;
     const prof = (x0, x1) => {
         const pr = new Float64Array(outH2);
@@ -242,7 +256,7 @@ JS = """async (arg) => {
     srcF.delete(); dstF.delete(); gF.delete(); mX2.delete(); mY2.delete();
 
     return { curErr: curErr === null ? -1 : +curErr.toFixed(1), fitErr: +fitErr.toFixed(1), initErr: +initErr.toFixed(1), oracleErr: +oracleErr.toFixed(1),
-             flatShift: +flatShift.toFixed(2), edgeErr, aspectFix, lineTilt, lineBow, stripShift, marginSlant: marginSlant < 0 ? -1 : +marginSlant.toFixed(1),
+             flatShift: +flatShift.toFixed(2), edgeErr, nLines: textInfo.lines.length, nStarts: textInfo.starts.length, rectInfo, aspectFix, lineTilt, lineBow, stripShift, marginSlant: marginSlant < 0 ? -1 : +marginSlant.toFixed(1),
              Pz: { z1:+P3.z1.toFixed(2), z2:+P3.z2.toFixed(2), z1b:+(P3.z1b??P3.z1).toFixed(2), z2b:+(P3.z2b??P3.z2).toFixed(2), rx:+P3.rx.toFixed(2), ry:+P3.ry.toFixed(2) } };
 }"""
 
@@ -260,8 +274,8 @@ with sync_playwright() as p:
     cw = float(os.environ.get("CURV_W", "0"))
     gw = float(os.environ.get("GUIDE_W", "8")); sl = float(os.environ.get("SLACK", "0.015"))
     rw = float(os.environ.get("ROW_W", "0")); fl = os.environ.get("F_LIST", "")
-    pg.evaluate(f"() => {{ window.PM_CURV_W = {cw}; window.PM_GUIDE_W = {gw}; window.PM_SLACK = {sl}; window.PM_ROW_W = {rw}; window.PM_TW_W = {os.environ.get("TW_W", "0")}; window.PM_ROW_W2 = {os.environ.get("ROW_W2", "0")}; window.PM_SOFT_W = {os.environ.get("SOFT_W", "1.0")}; window.PM_TEXT_FIRST = {os.environ.get("TEXT_FIRST", "0")}; window.PM_ROW_SLACK = {os.environ.get("ROW_SLACK", "0.006")}; window.PM_ROW_WPTS = {os.environ.get("ROW_WPTS", "20")}; if ('{fl}') window.PM_F_LIST = [{fl}]; }}")
-    print(f"== 곡률 {cw} / 앵커 {gw} / 여유 {sl} / 글줄 {rw} / 비틀림페널티 {os.environ.get('TW_W', '0')} / 연경계 {os.environ.get('SOFT_W','1.0')} / 글자우선 {os.environ.get('TEXT_FIRST','0')} / 2단계글줄 {os.environ.get('ROW_W2', '0')} 여유{os.environ.get('ROW_SLACK','0.006')} 강도{os.environ.get('ROW_WPTS','20')} / F {fl or 0.75} ==")
+    pg.evaluate(f"() => {{ window.PM_CURV_W = {cw}; window.PM_GUIDE_W = {gw}; window.PM_SLACK = {sl}; window.PM_ROW_W = {rw}; window.PM_TW_W = {os.environ.get("TW_W", "0")}; window.PM_ROW_W2 = {os.environ.get("ROW_W2", "0")}; window.PM_SOFT_W = {os.environ.get("SOFT_W", "1.0")}; window.PM_TEXT_FIRST = {os.environ.get("TEXT_FIRST", "0")}; window.PM_TL_W = {os.environ.get("TL_W", "0")}; window.PM_RECT = {os.environ.get("RECT", "0")}; window.PM_ROW_SLACK = {os.environ.get("ROW_SLACK", "0.006")}; window.PM_ROW_WPTS = {os.environ.get("ROW_WPTS", "20")}; if ('{fl}') window.PM_F_LIST = [{fl}]; }}")
+    print(f"== 곡률 {cw} / 앵커 {gw} / 여유 {sl} / 글줄 {rw} / 비틀림페널티 {os.environ.get('TW_W', '0')} / 연경계 {os.environ.get('SOFT_W','1.0')} / 글자우선 {os.environ.get('TEXT_FIRST','0')} / 글줄곡선 {os.environ.get('TL_W','0')} / 직교화 {os.environ.get('RECT','0')} / 2단계글줄 {os.environ.get('ROW_W2', '0')} 여유{os.environ.get('ROW_SLACK','0.006')} 강도{os.environ.get('ROW_WPTS','20')} / F {fl or 0.75} ==")
     tot = {"cur": [], "fit": [], "orc": []}
     only = os.environ.get("ONLY", "")
     for name in GT.keys():
@@ -269,7 +283,7 @@ with sync_playwright() as p:
         with open(rf"C:/python_work/test_photos/{name}", "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
         r = pg.evaluate(JS, [b64, GT[name]])
-        print(f"[{name}] 외곽={r['oracleErr']}px (상{r['edgeErr']['top']}/하{r['edgeErr']['bot']}/좌{r['edgeErr']['left']}/우{r['edgeErr']['right']}) 시프트={r['flatShift']}% 글줄기울기={r['lineTilt']}도 글줄휨={r['lineBow']}px 띠시프트={r['stripShift']} 비율보정={r['aspectFix']}")
+        print(f"[{name}] 외곽={r['oracleErr']}px (상{r['edgeErr']['top']}/하{r['edgeErr']['bot']}/좌{r['edgeErr']['left']}/우{r['edgeErr']['right']}) 시프트={r['flatShift']}% 글줄기울기={r['lineTilt']}도 글줄휨={r['lineBow']}px 띠시프트={r['stripShift']} 비율보정={r['aspectFix']} 글줄검출={r['nLines']}/시작점{r['nStarts']} 직교화={r['rectInfo']}")
         if r["curErr"] >= 0: tot["cur"].append(r["curErr"])
         tot["fit"].append(r["fitErr"]); tot["orc"].append(r["oracleErr"]); tot.setdefault("ini", []).append(r["initErr"])
     if len(tot['orc']) == 0: pass
