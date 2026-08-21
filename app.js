@@ -784,6 +784,10 @@ async function detectCorners(page) {
       }
     }
 
+    if (corners && page.fromCamera) {
+      corners = enforceLeftGuide(corners, c.width, c.height); // 빨간 기준선 = 왼쪽 경계 정답
+      if (curves && curves.left) curves.left = null;
+    }
     if (corners) {
       const up = (p) => ({ x: p.x / scale, y: p.y / scale }); // 감지 좌표 → 원본 좌표
       page.corners = { tl: up(corners.tl), tr: up(corners.tr), br: up(corners.br), bl: up(corners.bl) };
@@ -1286,6 +1290,26 @@ async function flipCameraOrientation() {
 /* 실시간 문서 감지 오버레이 — 시간 평활(EMA)로 떨림 억제 + 안정 상태 표시 */
 const liveDetect = { quad: null, poly: null, pending: null, hitStreak: 0, missStreak: 0 };
 
+/* 빨간 기준선 규칙(사용자 원칙: 책의 왼쪽 변은 항상 빨간 선에 맞춘다):
+   - 왼쪽 경계는 기준선 왼쪽으로 절대 못 넘는다 (넘으면 책상·옆 책을 잡은 것)
+   - 기준선 오른쪽 4% 이내면 기준선에 스냅, 좌측 하단 모서리는 빨간 꺾쇠(가이드 좌하단)에 스냅
+   W,H = 해당 좌표계(감지 캔버스)의 크기 */
+function enforceLeftGuide(q, W, H) {
+  const gx0 = W * GUIDE_INSET, gy1 = H * (1 - GUIDE_INSET);
+  const band = W * 0.04;
+  const out = { tl: { ...q.tl }, tr: { ...q.tr }, br: { ...q.br }, bl: { ...q.bl } };
+  for (const k of ['tl', 'bl']) {
+    if (out[k].x < gx0 + band) out[k].x = gx0; // 왼쪽 초과 → 기준선, 근접 → 스냅
+  }
+  if (Math.abs(out.bl.y - gy1) < H * 0.04 && out.bl.x === gx0) out.bl.y = gy1; // 좌하단 꺾쇠에 스냅
+  return out;
+}
+function clampPolyToGuide(poly, W) {
+  const gx0 = W * GUIDE_INSET;
+  for (const p of poly) if (p.x < gx0) p.x = gx0;
+  return poly;
+}
+
 /* 윤곽을 고정 개수 점(상·하 9, 좌·우 5)으로 재표본 — 프레임 간 1:1 대응이 되어 선 전체를 평활할 수 있다 */
 function resamplePath(pts, n) {
   if (!pts || pts.length < 2) return null;
@@ -1377,7 +1401,10 @@ function startLiveOverlay() {
       const found = foundRes ? foundRes.quad : null;
       if (found) {
         const curves = foundRes.curves || extractCurves(foundRes.contour, foundRes.quad);
-        const poly = outlinePolyline(found, curves);
+        const fixed = enforceLeftGuide(found, work.width, work.height);
+        found.tl = fixed.tl; found.bl = fixed.bl;
+        if (curves && curves.left) curves.left = null; // 왼쪽 변은 기준선(직선)
+        const poly = clampPolyToGuide(outlinePolyline(found, curves), work.width);
         // 후보 방식이 바뀌어 윤곽이 멀리 점프하면 바로 따라가지 않고 같은 자리가 2번 연속 나올 때만 수용
         const jumpTol = 0.10 * Math.max(work.width, work.height);
         if (liveDetect.poly && liveDetect.hitStreak >= 2 && polyMaxDist(liveDetect.poly, poly) > jumpTol) {
