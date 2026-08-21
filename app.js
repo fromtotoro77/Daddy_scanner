@@ -985,23 +985,26 @@ function removeFingers(canvas) {
   const paper = samp[Math.floor(samp.length * 0.7)];
   const labels = new cv.Mat(), stats = new cv.Mat(), cents = new cv.Mat();
   const n = cv.connectedComponentsWithStats(mask, labels, stats, cents, 8, cv.CV_32S);
-  const keep = new cv.Mat.zeros(H, W, cv.CV_8U);
+  const keep = cv.Mat.zeros(H, W, cv.CV_8U);
   const lab = labels.data32S; const md = mask.data;
   let kept = 0;
+  const dbg = { W, H, paper, comps: [] };
   for (let i = 1; i < n; i++) {
     const x = stats.intAt(i, cv.CC_STAT_LEFT), y = stats.intAt(i, cv.CC_STAT_TOP);
     const w = stats.intAt(i, cv.CC_STAT_WIDTH), h = stats.intAt(i, cv.CC_STAT_HEIGHT);
     const area = stats.intAt(i, cv.CC_STAT_AREA);
     const touches = x <= 1 || y <= 1 || x + w >= W - 1 || y + h >= H - 1;
-    if (!touches || area < W * H * 0.0008 || area > W * H * 0.2) continue;
-    // 성분 평균 밝기
     let sum = 0, c = 0;
     for (let yy = y; yy < y + h; yy += 2) for (let xx = x; xx < x + w; xx += 2) { const j = yy * W + xx; if (lab[j] === i) { sum += gd[j]; c++; } }
-    if (!c || sum / c > paper - 15) continue;
+    const mean = c ? sum / c : 0;
+    if (area > W * H * 0.0003) dbg.comps.push({ x, y, w, h, areaPct: +(area / (W * H) * 100).toFixed(2), touches, mean: Math.round(mean) });
+    if (!touches || area < W * H * 0.0008 || area > W * H * 0.2) continue;
+    if (!c || mean > paper - 15) continue;
     for (let yy = y; yy < y + h; yy++) for (let xx = x; xx < x + w; xx++) { const j = yy * W + xx; if (lab[j] === i) keep.data[j] = 255; }
     kept++;
   }
   labels.delete(); stats.delete(); cents.delete(); mask.delete(); gray.delete();
+  state.lastFingerDbg = dbg;
   if (!kept) { src.delete(); rgb.delete(); keep.delete(); k5.delete(); k9.delete(); return false; }
   // 경계 여유: 손가락 가장자리 그림자까지 포함
   const kd = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(Math.max(7, Math.round(W * 0.012)) | 1, Math.max(7, Math.round(W * 0.012)) | 1));
@@ -1011,7 +1014,7 @@ function removeFingers(canvas) {
   const smallRgb = new cv.Mat(); cv.resize(rgb, smallRgb, new cv.Size(sw, sh), 0, 0, cv.INTER_AREA);
   const smallMask = new cv.Mat(); cv.resize(keep, smallMask, new cv.Size(sw, sh), 0, 0, cv.INTER_NEAREST);
   cv.dilate(smallMask, smallMask, k5);
-  const filledS = new cv.Mat(); cv.inpaint(smallRgb, filledS, smallMask, 5, cv.INPAINT_TELEA);
+  const filledS = new cv.Mat(); cv.inpaint(smallRgb, smallMask, filledS, 5, cv.INPAINT_TELEA); // (src, mask, dst, radius, flags)
   const filled = new cv.Mat(); cv.resize(filledS, filled, new cv.Size(W, H), 0, 0, cv.INTER_LINEAR);
   // 부드러운 합성
   const alpha = new cv.Mat(); cv.GaussianBlur(keep, alpha, new cv.Size(0, 0), Math.max(2, W * 0.004));
