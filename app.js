@@ -1043,7 +1043,8 @@ function rotateCanvas(canvas, deg) {
 /* ---------- 필터 (요구 7 — 문자 가독성 중심) ---------- */
 function applyFilter(canvas, filter, bright = 0, contrast = 0) {
   if (filter === 'bw' && state.cvReady) { applyBWAdaptive(canvas); applyBC(canvas, bright, contrast); return; }
-  if (filter === 'sharpen' && state.cvReady) { applyMagic(canvas); applySharpenCV(canvas); applyBC(canvas, bright, contrast); return; }
+  if (filter === 'magic' && state.cvReady) { applyMagic(canvas, 0.35); applyBC(canvas, bright, contrast); return; }
+  if (filter === 'sharpen' && state.cvReady) { applyMagic(canvas, 0.9); applyBC(canvas, bright, contrast); return; }
 
   const ctx = canvas.getContext('2d');
   const im = ctx.getImageData(0, 0, canvas.width, canvas.height);
@@ -1073,7 +1074,38 @@ function applyFilter(canvas, filter, bright = 0, contrast = 0) {
   ctx.putImageData(im, 0, 0);
 }
 
-/* 매직컬러: 종이 흰색 기준 화이트밸런스 + 전 채널 공통 대비 곡선
+/* 매직컬러(OpenCV): 국소 조명 정규화(플랫필드) → 전역 곡선 → 언샤프.
+   책 페이지의 책등 그림자·불균일 조명을 지우고 종이를 균일한 흰색으로 만들되, 채널 공통 게인이라 색조는 유지.
+   배경(조명)은 1/4 축소본에서 큰 닫힘 연산(글자 제거)+블러로 추정. 게인 상한 2.0 — 큰 그림·사진이 탈색되지 않게 */
+function applyMagic(canvas, sharpenAmount = 0.35) {
+  const W = canvas.width, H = canvas.height;
+  const src = cv.imread(canvas);
+  const gray = new cv.Mat(); cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+  const ds = Math.min(1, 400 / Math.max(W, H));
+  const sw = Math.max(8, Math.round(W * ds)), sh = Math.max(8, Math.round(H * ds));
+  const small = new cv.Mat(); cv.resize(gray, small, new cv.Size(sw, sh), 0, 0, cv.INTER_AREA);
+  const k = (Math.max(9, Math.round(Math.min(sw, sh) / 18)) | 1);
+  const kern = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(k, k));
+  const bgS = new cv.Mat(); cv.morphologyEx(small, bgS, cv.MORPH_CLOSE, kern);
+  cv.GaussianBlur(bgS, bgS, new cv.Size(0, 0), k / 2);
+  const bg = new cv.Mat(); cv.resize(bgS, bg, new cv.Size(W, H), 0, 0, cv.INTER_LINEAR);
+  const d = src.data, b = bg.data, n = W * H;
+  for (let i = 0, j = 0; i < n; i++, j += 4) {
+    const g = Math.min(2.0, 246 / Math.max(60, b[i]));
+    const r = d[j] * g, gg = d[j + 1] * g, bb = d[j + 2] * g;
+    d[j] = r > 255 ? 255 : r; d[j + 1] = gg > 255 ? 255 : gg; d[j + 2] = bb > 255 ? 255 : bb;
+  }
+  magicLUTApply(d); // 종이 화이트밸런스 + 섀도 컷 (전역)
+  if (sharpenAmount > 0) {
+    const blur = new cv.Mat(); cv.GaussianBlur(src, blur, new cv.Size(0, 0), 1.2);
+    cv.addWeighted(src, 1 + sharpenAmount, blur, -sharpenAmount, 0, src);
+    blur.delete();
+  }
+  cv.imshow(canvas, src);
+  src.delete(); gray.delete(); small.delete(); kern.delete(); bgS.delete(); bg.delete();
+}
+
+/* 매직컬러(폴백, OpenCV 없을 때): 종이 흰색 기준 화이트밸런스 + 전 채널 공통 대비 곡선
    (채널별 독립 스트레칭은 색조가 왜곡되므로 사용하지 않음) */
 function magicLUTApply(d) {
   const histR = new Uint32Array(256), histG = new Uint32Array(256), histB = new Uint32Array(256);
