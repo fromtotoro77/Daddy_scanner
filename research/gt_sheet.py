@@ -59,8 +59,8 @@ JS = """async (arg) => {
     const al = pmAlignToQuad(gtC, W, H, pmInit(gtGuide, W, H));
     const P0 = al.P;
     gtGuide.anchorC = gtC;
-    gtGuide.slack = 0.015 * Math.max(W, H);
-    gtGuide.w = 8.0;
+    gtGuide.slack = 0.01 * Math.max(W, H);
+    gtGuide.w = 20;
     const { P } = pmFitMulti(field, W, H, gtGuide, P0);
 
     // 시각화
@@ -115,11 +115,12 @@ with sync_playwright() as p:
             break
         pg.wait_for_timeout(1000)
     pg.add_script_tag(path=SCRATCH + "/pagemodel.js")
-    for name in ("1.jpg", "2.jpg", "3.jpg", "4.jpg"):
+    pg.evaluate("() => window.PM_CURV_W = 150")
+    for idx, name in enumerate(GT.keys(), 1):
         with open(rf"C:/python_work/test_photos/{name}", "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
         r = pg.evaluate(JS, [b64, GT[name]])
-        n = name.split(".")[0]
+        n = idx
         with open(f"gts{n}_viz.jpg", "wb") as f:
             f.write(base64.b64decode(r["viz"].split(",", 1)[1]))
         with open(f"gts{n}_out.jpg", "wb") as f:
@@ -130,7 +131,7 @@ server.shutdown()
 
 from PIL import Image, ImageDraw
 rows = []
-for i in (1, 2, 3, 4):
+for i in range(1, len(GT) + 1):
     a = Image.open(f'gts{i}_viz.jpg'); a.thumbnail((760, 520))
     bb = Image.open(f'gts{i}_out.jpg'); bb.thumbnail((760, 520))
     w = a.width + bb.width + 25
@@ -145,5 +146,5 @@ W = max(r.width for r in rows); H = sum(r.height for r in rows) + 12 * len(rows)
 s = Image.new('RGB', (W, H), (12, 12, 14)); y = 0
 for r in rows:
     s.paste(r, (0, y)); y += r.height + 12
-s.save('C:/python_work/test_photos/trustfit_v4.jpg', quality=88)
+s.save('C:/python_work/test_photos/trustfit_v8_align.jpg', quality=88)
 print('sheet saved')

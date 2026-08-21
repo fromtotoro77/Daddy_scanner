@@ -75,6 +75,9 @@ function pmScore(P, fieldObj, W, H, guide) {
       s -= guide.w * Math.max(0, dev - guide.slack);
     }
   }
+  // 곡률 오컴 페널티: 증거가 밀어붙이지 않는 한 직선 유지 (평면 문서 과곡률 방지)
+  const cw = (typeof window !== 'undefined' && window.PM_CURV_W) ? window.PM_CURV_W : 0;
+  if (cw) s -= cw * (Math.abs(P.z1) + Math.abs(P.z2) + Math.abs(P.z1b ?? P.z1) + Math.abs(P.z2b ?? P.z2));
   if (fieldObj.gray) {
     s += 1.6 * pmInteriorScore(P, fieldObj.gray, W, H); // 글자 줄 정합
     s += 0.45 * pmPolarityScore(P, fieldObj.gray, W, H); // 극성: 안쪽 밝음→바깥 어두움 전이 보상
@@ -201,12 +204,22 @@ function pmFitMulti(field, W, H, guide, baseInit) {
     { z1: 0.15, z2: 0.05 },
     { z1: 0.05, z2: 0.15 },
     { z1: -0.08, z2: -0.08 },
+    { z1: -0.15, z2: -0.05 },
+    { z1: -0.05, z2: -0.15 },
     { ry: 0.15 }, { ry: -0.15 }, { rx: 0.15 }, { rx: -0.15 },
   ];
   let bestR = null;
   for (const s of seeds) {
     const r = pmFit(field, W, H, guide, { ...baseInit, ...s });
     if (!bestR || r.score > bestR.score) bestR = r;
+  }
+  // 곡률 부호 반전 검사: 위로 말림↔아래로 불룩은 외곽선만으로 헷갈리는 국소해 쌍 —
+  // 최적해의 곡률을 뒤집어 다시 맞춰보고 더 좋은 쪽을 택한다
+  {
+    const bp = bestR.P;
+    const flipped = { ...bp, z1: -bp.z1, z2: -bp.z2, z1b: -(bp.z1b ?? bp.z1), z2b: -(bp.z2b ?? bp.z2) };
+    const r = pmFit(field, W, H, guide, flipped);
+    if (r.score > bestR.score) bestR = r;
   }
   // 마무리 정밀 폴리시 (점점 작은 스텝 2단계)
   let cur = bestR;
@@ -220,42 +233,107 @@ function pmFitMulti(field, W, H, guide, baseInit) {
 
 /* 자세 정합: 평평한 모델(z=0)의 네 모서리를 목표 사각형 모서리에 맞춘다
    (기울어진 페이지도 회전·이동·크기로 정확히 초기화 — 이후 이미지 피팅은 정밀화만) */
+/* 4점 호모그래피 (DLT, h33=1) — 8×8 가우스 소거 */
+function pmHomography4(src, dst) {
+  const A = [], b = [];
+  for (let i = 0; i < 4; i++) {
+    const [x, y] = src[i], [X, Y] = dst[i];
+    A.push([x, y, 1, 0, 0, 0, -X * x, -X * y]); b.push(X);
+    A.push([0, 0, 0, x, y, 1, -Y * x, -Y * y]); b.push(Y);
+  }
+  const n = 8;
+  for (let c = 0; c < n; c++) {
+    let piv = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(A[r][c]) > Math.abs(A[piv][c])) piv = r;
+    [A[c], A[piv]] = [A[piv], A[c]]; [b[c], b[piv]] = [b[piv], b[c]];
+    if (Math.abs(A[c][c]) < 1e-12) return null;
+    for (let r = 0; r < n; r++) {
+      if (r === c) continue;
+      const f = A[r][c] / A[c][c];
+      for (let k = c; k < n; k++) A[r][k] -= f * A[c][k];
+      b[r] -= f * b[c];
+    }
+  }
+  const h = b.map((v, i) => v / A[i][i]);
+  return [h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], 1];
+}
+
+/* 해석적 자세: 단위 사각형(중심 원점) → 화면 모서리 호모그래피를 K⁻¹로 정규화하면
+   열벡터가 [pw·r1, ph·r2, t] (t.z=1) — 크기·회전·이동을 직접 읽는다 (F 불일치는 직교화로 흡수) */
+function pmPoseFromQuad(targetC, W, H, F) {
+  const src = [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]];
+  const dst = [targetC.tl, targetC.tr, targetC.br, targetC.bl].map((p) => [(p.x - W / 2) / F, (p.y - H / 2) / F]);
+  const h = pmHomography4(src, dst);
+  if (!h) return null;
+  const lam = h[8];
+  if (Math.abs(lam) < 1e-9) return null;
+  const c1 = [h[0] / lam, h[3] / lam, h[6] / lam];
+  const c2 = [h[1] / lam, h[4] / lam, h[7] / lam];
+  const t = [h[2] / lam, h[5] / lam, 1];
+  const pw = Math.hypot(c1[0], c1[1], c1[2]), ph = Math.hypot(c2[0], c2[1], c2[2]);
+  if (!(pw > 1e-6) || !(ph > 1e-6)) return null;
+  const r1 = c1.map((v) => v / pw);
+  let r2 = c2.map((v) => v / ph);
+  const dot = r1[0] * r2[0] + r1[1] * r2[1] + r1[2] * r2[2];
+  r2 = r2.map((v, i) => v - dot * r1[i]);
+  const n2 = Math.hypot(r2[0], r2[1], r2[2]);
+  if (!(n2 > 1e-6)) return null;
+  r2 = r2.map((v) => v / n2);
+  const r3 = [r1[1] * r2[2] - r1[2] * r2[1], r1[2] * r2[0] - r1[0] * r2[2], r1[0] * r2[1] - r1[1] * r2[0]];
+  // R = Rz·Ry·Rx 분해: R20=-sin(ry), R21=cy·sx, R22=cy·cx, R10=sz·cy, R00=cz·cy
+  const ry = Math.asin(Math.max(-1, Math.min(1, -r1[2])));
+  const rx = Math.atan2(r2[2], r3[2]);
+  const rz = Math.atan2(r1[1], r1[0]);
+  return { F, tx: t[0], ty: t[1], pw, ph, rx, ry, rz, z1: 0, z2: 0 };
+}
+
 function pmAlignToQuad(targetC, W, H, baseInit) {
-  const P = { ...baseInit, z1: 0, z2: 0 };
+  const quadLoss = (Q) => {
+    const c = [pmProject(Q, 0, 0, W, H), pmProject(Q, 1, 0, W, H), pmProject(Q, 1, 1, W, H), pmProject(Q, 0, 1, W, H)];
+    if (c.some((p) => !p)) return 1e9;
+    return Math.hypot(c[0][0]-targetC.tl.x, c[0][1]-targetC.tl.y) + Math.hypot(c[1][0]-targetC.tr.x, c[1][1]-targetC.tr.y)
+         + Math.hypot(c[2][0]-targetC.br.x, c[2][1]-targetC.br.y) + Math.hypot(c[3][0]-targetC.bl.x, c[3][1]-targetC.bl.y);
+  };
+  // 좌표하강 다듬기 (출발점마다 독립 실행)
   const names = ['tx', 'ty', 'pw', 'ph', 'rx', 'ry', 'rz'];
   const step0 = { tx: 0.05, ty: 0.05, pw: 0.06, ph: 0.06, rx: 0.08, ry: 0.08, rz: 0.05 };
-  const corners = () => {
-    const c = [pmProject(P, 0, 0, W, H), pmProject(P, 1, 0, W, H), pmProject(P, 1, 1, W, H), pmProject(P, 0, 1, W, H)];
-    return c.some((p) => !p) ? null : c;
-  };
-  const loss = () => {
-    const c = corners();
-    if (!c) return 1e9;
-    return Math.hypot(c[0][0]-targetC.tl.x, c[0][1]-targetC.tl.y)
-         + Math.hypot(c[1][0]-targetC.tr.x, c[1][1]-targetC.tr.y)
-         + Math.hypot(c[2][0]-targetC.br.x, c[2][1]-targetC.br.y)
-         + Math.hypot(c[3][0]-targetC.bl.x, c[3][1]-targetC.bl.y);
-  };
-  let best = loss();
-  for (let round = 0; round < 70; round++) {
-    let improved = false;
-    for (const k of names) {
-      const st = step0[k] * Math.pow(0.93, round);
-      for (const dir of [1, -1]) {
-        let moved = false;
-        for (let hop = 0; hop < 6; hop++) {
-          const old = P[k];
-          P[k] = old + dir * st;
-          const s = loss();
-          if (s < best) { best = s; improved = true; moved = true; }
-          else { P[k] = old; break; }
+  const descend = (start, scale) => {
+    const P = { ...start };
+    let best = quadLoss(P);
+    for (let round = 0; round < 70; round++) {
+      let improved = false;
+      for (const k of names) {
+        const st = step0[k] * scale * Math.pow(0.93, round);
+        for (const dir of [1, -1]) {
+          let moved = false;
+          for (let hop = 0; hop < 6; hop++) {
+            const old = P[k];
+            P[k] = old + dir * st;
+            const s = quadLoss(P);
+            if (s < best) { best = s; improved = true; moved = true; }
+            else { P[k] = old; break; }
+          }
+          if (moved) break;
         }
-        if (moved) break;
       }
+      if (!improved && round > 15) break;
     }
-    if (!improved && round > 15) break;
+    return { P, loss: best };
+  };
+  // 출발점 후보: 평면 정면 초기값 + F 후보별 해석적 자세(호모그래피 분해).
+  // 말린 페이지의 모서리는 한 평면에 있지 않아 해석해에도 잔차가 남으므로,
+  // 각 출발점에서 다듬은 뒤 잔차 최소를 택한다
+  const starts = [{ P: { ...baseInit, z1: 0, z2: 0 }, scale: 1 }];
+  for (const fm of [0.8, 1.0, 1.15, 1.4, 1.8, 2.4]) {
+    const Q = pmPoseFromQuad(targetC, W, H, fm * Math.max(W, H));
+    if (Q && quadLoss(Q) < 1e8) starts.push({ P: Q, scale: 0.4 });
   }
-  return { P, cornerLoss: best / 4 };
+  let bestR = null;
+  for (const s of starts) {
+    const r = descend(s.P, s.scale);
+    if (!bestR || r.loss < bestR.loss) bestR = r;
+  }
+  return { P: bestR.P, cornerLoss: bestR.loss / 4 };
 }
 
 /* 초기값: 가이드 사각형(평평·정면 가정)에서 역산 */

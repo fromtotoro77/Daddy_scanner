@@ -4,7 +4,8 @@ from playwright.sync_api import sync_playwright
 
 SCRATCH = r"C:/Users/ToTo/AppData/Local/Temp/claude/c--python-work/a92b09e6-f53b-4eb4-8c03-a5a796985259/scratchpad"
 ROOT = r"C:/python_work/01_completed/005_daddy_scanner"
-PORT = 8803
+import os
+PORT = int(os.environ.get("PORT", "8803"))
 server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT),
     functools.partial(http.server.SimpleHTTPRequestHandler, directory=ROOT))
 threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -121,8 +122,8 @@ JS = """async (arg) => {
     const al = pmAlignToQuad(gtC, W, H, pmInit(gtGuide, W, H));
     const P0 = al.P;
     gtGuide.anchorC = gtC;                    // 신뢰영역 = 모서리 4점만
-    gtGuide.slack = 0.015 * Math.max(W, H);   // 모서리는 더 엄격
-    gtGuide.w = 8.0;
+    gtGuide.slack = (window.PM_SLACK || 0.015) * Math.max(W, H);   // 모서리는 더 엄격
+    gtGuide.w = (window.PM_GUIDE_W || 8.0);
     const line0 = (Pp, v) => Array.from({length: 21}, (_, i) => {
         const p = pmProject(Pp, i / 20, v, W, H); return { x: p[0], y: p[1] };
     });
@@ -133,6 +134,13 @@ JS = """async (arg) => {
     const r3x = pmFitMulti(field, W, H, gtGuide, P0);
     const P3 = r3x.P;
     const oracleErr = evalOutline(line0(P3, 0), line0(P3, 1), side0(P3, 0), side0(P3, 1));
+    // 변별 오차 분해
+    const edgeErr = {};
+    for (const [k, pts, poly] of [["top", line0(P3,0), gtTop], ["bot", line0(P3,1), gtBot], ["left", side0(P3,0), gtLeft], ["right", side0(P3,1), gtRight]]) {
+        let se = 0;
+        for (const p of pts) se += d2poly(p, poly);
+        edgeErr[k] = Math.round(se / pts.length / S * 10) / 10;
+    }
 
     // 평탄화 품질 자동 측정: 펴진 결과에서 좌/중/우 세로 명암 프로파일의 상호 시프트(글줄 어긋남)
     const outW2 = 420, outH2 = 560;
@@ -190,7 +198,7 @@ JS = """async (arg) => {
     srcF.delete(); dstF.delete(); gF.delete(); mX2.delete(); mY2.delete();
 
     return { curErr: curErr === null ? -1 : +curErr.toFixed(1), fitErr: +fitErr.toFixed(1), initErr: +initErr.toFixed(1), oracleErr: +oracleErr.toFixed(1),
-             flatShift: +flatShift.toFixed(2), marginSlant: marginSlant < 0 ? -1 : +marginSlant.toFixed(1),
+             flatShift: +flatShift.toFixed(2), edgeErr, marginSlant: marginSlant < 0 ? -1 : +marginSlant.toFixed(1),
              Pz: { z1:+P3.z1.toFixed(2), z2:+P3.z2.toFixed(2), z1b:+(P3.z1b??P3.z1).toFixed(2), z2b:+(P3.z2b??P3.z2).toFixed(2), rx:+P3.rx.toFixed(2), ry:+P3.ry.toFixed(2) } };
 }"""
 
@@ -204,12 +212,17 @@ with sync_playwright() as p:
             break
         pg.wait_for_timeout(1000)
     pg.add_script_tag(path=SCRATCH + "/pagemodel.js")
+    import os
+    cw = float(os.environ.get("CURV_W", "0"))
+    gw = float(os.environ.get("GUIDE_W", "8")); sl = float(os.environ.get("SLACK", "0.015"))
+    pg.evaluate(f"() => {{ window.PM_CURV_W = {cw}; window.PM_GUIDE_W = {gw}; window.PM_SLACK = {sl}; }}")
+    print(f"== 곡률 {cw} / 앵커 {gw} / 여유 {sl} ==")
     tot = {"cur": [], "fit": [], "orc": []}
-    for name in ("1.jpg", "2.jpg", "3.jpg", "4.jpg"):
+    for name in GT.keys():
         with open(rf"C:/python_work/test_photos/{name}", "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
         r = pg.evaluate(JS, [b64, GT[name]])
-        print(f"[{name}] 외곽={r['oracleErr']}px 시프트={r['flatShift']}% 여백기울기={r['marginSlant']}도")
+        print(f"[{name}] 외곽={r['oracleErr']}px (상{r['edgeErr']['top']}/하{r['edgeErr']['bot']}/좌{r['edgeErr']['left']}/우{r['edgeErr']['right']}) 시프트={r['flatShift']}% 여백기울기={r['marginSlant']}도")
         if r["curErr"] >= 0: tot["cur"].append(r["curErr"])
         tot["fit"].append(r["fitErr"]); tot["orc"].append(r["oracleErr"]); tot.setdefault("ini", []).append(r["initErr"])
     print(f"평균: 기존={sum(tot['cur'])/len(tot['cur']):.1f}  피팅={sum(tot['fit'])/4:.1f}  init만={sum(tot['ini'])/4:.1f}  신뢰영역={sum(tot['orc'])/4:.1f} px")
