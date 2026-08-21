@@ -5,14 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <meta name="theme-color" content="#0c0c0e">
     <title>Daddy Scanner</title>
-    <link rel="manifest" href="manifest.json?v=1.4.4">
+    <link rel="manifest" href="manifest.json?v=1.5.0">
     <link rel="icon" type="image/png" href="icons/icon-192.png">
     <link rel="apple-touch-icon" href="icons/icon-192.png">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet"
         href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@700&family=Outfit:wght@700;900&display=swap">
-    <link rel="stylesheet" href="app.css?v=1.4.4">
+    <link rel="stylesheet" href="app.css?v=1.5.0">
 </head>
 <body>
     <!-- 시작 스플래시 — 헌정 문구 -->
@@ -29,7 +29,7 @@
                 <svg viewBox="0 0 24 24"><path d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
             </button>
             <div class="logo">
-                <span class="logo-text">Daddy scanner <small class="logo-ver">v1.4.4</small></span>
+                <span class="logo-text">Daddy scanner <small class="logo-ver">v1.5.0</small></span>
             </div>
         </header>
 
@@ -142,6 +142,11 @@
                     <label><span>밝기</span><input type="range" id="sl-bright" min="-50" max="80" value="0"><b id="sl-bright-v" class="mono">0</b></label>
                     <label><span>대비</span><input type="range" id="sl-contrast" min="-50" max="80" value="0"><b id="sl-contrast-v" class="mono">0</b></label>
                 </div>
+                <div class="opt-chips hidden" id="opt-chips">
+                    <span class="opt-label">평탄화</span>
+                    <button id="opt-textrect" class="chip active">글줄 직교화</button>
+                    <button id="opt-margin" class="chip active">좌측정렬 보정</button>
+                </div>
                 <div class="bar-spacer"></div>
                 <div class="action-bar">
                     <button id="btn-rotate" class="bar-btn icon-only" aria-label="회전">
@@ -223,6 +228,7 @@
 
     <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jscanify@1.4.3/src/jscanify.min.js"></script>
-    <script src="app.js?v=1.4.4"></script>
+    <script src="pagemodel.js?v=1.5.0"></script>
+    <script src="app.js?v=1.5.0"></script>
 </body>
 </html>

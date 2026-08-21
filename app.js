@@ -789,6 +789,8 @@ async function detectCorners(page) {
       page.corners = { tl: up(corners.tl), tr: up(corners.tr), br: up(corners.br), bl: up(corners.bl) };
       page.curves = curves ? mapCurvePoints(curves, up) : null;
       page.thumbDirty = true;
+      persistPage(page);
+      await fitModelForPage(page, c, scale); // 앵커 확보 → 페이지 모델 피팅 (수 초, UI 양보하며)
     }
     persistPage(page);
   } catch (e) {
@@ -821,6 +823,123 @@ function quadArea(c) {
 }
 
 /* ============================================================
+   모델 기반 평탄화 (pagemodel.js 엔진)
+   앵커(가이드/자동감지/수동 모서리) → 페이지 모델 피팅(1단계 엣지, 2단계 글줄 수평)
+   → 원본 해상도 리맵 → 3단계 글줄 직교화 → 테두리 트림
+   ============================================================ */
+const yieldUI = () => new Promise((r) => setTimeout(r, 0));
+
+/* 피팅은 수 초 걸리므로 시드 사이마다 이벤트 루프에 양보 (카메라 프리뷰가 멈추지 않게) */
+async function fitPageModelAsync(canvas, anchors) {
+  const W = canvas.width, H = canvas.height;
+  const field = pmBuildField(canvas);
+  try {
+    const xs = [anchors.tl.x, anchors.tr.x, anchors.br.x, anchors.bl.x];
+    const ys = [anchors.tl.y, anchors.tr.y, anchors.br.y, anchors.bl.y];
+    const bbox = { x0: Math.min(...xs), x1: Math.max(...xs), y0: Math.min(...ys), y1: Math.max(...ys) };
+    const P0 = pmAlignToQuad(anchors, W, H, pmInit(bbox, W, H)).P;
+    const guide = { ...bbox, anchorC: anchors, slack: 0.01 * Math.max(W, H), w: 20 };
+    let best = null;
+    for (const s of PM_SEEDS) {
+      const r = pmFit(field, W, H, guide, { ...P0, ...s });
+      if (!best || r.score > best.score) best = r;
+      await yieldUI();
+    }
+    const flip = pmFit(field, W, H, guide, pmFlipCurl(best.P));
+    if (flip.score > best.score) best = flip;
+    for (const sc of [0.25, 0.08, 0.03]) {
+      const r = pmFit(field, W, H, guide, best.P, sc);
+      if (r.score > best.score) best = r;
+      await yieldUI();
+    }
+    // 2단계: 외곽은 고정하고 글줄 수평으로 자세 모호성(초점·요·비틀림·곡률 교환) 해소
+    const g2 = { anchorPts: pmOutline(best.P, W, H), slackPts: 0.003 * Math.max(W, H), wPts: 60, rowW: 300 };
+    let cur = { P: { ...best.P }, score: pmScore(best.P, field, W, H, g2) };
+    for (const sc of [0.5, 0.2, 0.08]) {
+      const r = pmFit(field, W, H, g2, cur.P, sc);
+      if (r.score > cur.score) cur = r;
+      await yieldUI();
+    }
+    return { P: cur.P, W, H };
+  } finally {
+    field.grayMat.delete();
+  }
+}
+
+async function makeDetectCanvas(page) {
+  const bmp = await createImageBitmap(page.blob);
+  const scale = Math.min(1, 1000 / Math.max(bmp.width, bmp.height));
+  const c = document.createElement('canvas');
+  c.width = Math.round(bmp.width * scale);
+  c.height = Math.round(bmp.height * scale);
+  c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+  bmp.close();
+  return { canvas: c, scale };
+}
+
+/* page.corners(원본 좌표)를 앵커로 모델 피팅 → page.model. 같은 페이지에 새 요청이 오면 이전 결과는 버림 */
+async function fitModelForPage(page, canvas, scale) {
+  if (!page.corners || !state.cvReady) { page.model = null; return; }
+  const seq = (page._modelSeq = (page._modelSeq || 0) + 1);
+  const dn = (p) => ({ x: p.x * scale, y: p.y * scale });
+  const anchors = { tl: dn(page.corners.tl), tr: dn(page.corners.tr), br: dn(page.corners.br), bl: dn(page.corners.bl) };
+  try {
+    const model = await fitPageModelAsync(canvas, anchors);
+    if (seq !== page._modelSeq) return;
+    page.model = model;
+  } catch (e) {
+    console.warn('모델 피팅 실패', e);
+    if (seq === page._modelSeq) page.model = null;
+  }
+  page.thumbDirty = true;
+  persistPage(page);
+}
+
+/* 모델로 평탄화: 모델은 감지 캔버스(≤1000px) 좌표, 리맵은 입력 해상도(K배)로 수행 */
+function warpModel(src, model, opts) {
+  const { P } = model;
+  const K = src.width / model.W;
+  const cs = [pmProject(P, 0, 0, model.W, model.H), pmProject(P, 1, 0, model.W, model.H),
+              pmProject(P, 1, 1, model.W, model.H), pmProject(P, 0, 1, model.W, model.H)];
+  if (cs.some((p) => !p)) throw new Error('model corners invalid');
+  const ys = cs.map((p) => p[1]);
+  let outH = Math.round((Math.max(...ys) - Math.min(...ys)) * K);
+  let outW = Math.round(outH * pmFlatAspect(P));
+  const cap = 8e6 / Math.max(1, outW * outH); // 리맵 테이블 메모리 보호
+  if (cap < 1) { outW = Math.round(outW * Math.sqrt(cap)); outH = Math.round(outH * Math.sqrt(cap)); }
+  outW = Math.max(24, outW); outH = Math.max(24, outH);
+  const rm = pmBuildRemap(P, model.W, model.H, outW, outH);
+  for (let i = 0; i < rm.mapX.length; i++) { rm.mapX[i] *= K; rm.mapY[i] *= K; }
+  const srcM = cv.imread(src);
+  let dst = new cv.Mat();
+  const mX = cv.matFromArray(outH, outW, cv.CV_32FC1, rm.mapX);
+  const mY = cv.matFromArray(outH, outW, cv.CV_32FC1, rm.mapY);
+  cv.remap(srcM, dst, mX, mY, cv.INTER_LINEAR, cv.BORDER_REPLICATE);
+  mX.delete(); mY.delete(); srcM.delete();
+  if (opts.textRect) {
+    const g = new cv.Mat(); cv.cvtColor(dst, g, cv.COLOR_RGBA2GRAY);
+    const rt = pmTextRectifyMaps(g, outW, outH, !!opts.marginFix);
+    g.delete();
+    if (rt) {
+      const mXr = cv.matFromArray(outH, outW, cv.CV_32FC1, rt.mapX);
+      const mYr = cv.matFromArray(outH, outW, cv.CV_32FC1, rt.mapY);
+      const d2 = new cv.Mat();
+      cv.remap(dst, d2, mXr, mYr, cv.INTER_LINEAR, cv.BORDER_REPLICATE);
+      dst.delete(); mXr.delete(); mYr.delete();
+      dst = d2;
+    }
+  }
+  const g2 = new cv.Mat(); cv.cvtColor(dst, g2, cv.COLOR_RGBA2GRAY);
+  const tb = pmTrimDarkBorders(g2.data, outW, outH);
+  g2.delete();
+  const roi = dst.roi(new cv.Rect(tb.x0, tb.y0, tb.x1 - tb.x0, tb.y1 - tb.y0));
+  const out = document.createElement('canvas');
+  cv.imshow(out, roi);
+  roi.delete(); dst.delete();
+  return out;
+}
+
+/* ============================================================
    이미지 처리 파이프라인: 원본 → 원근보정 → 회전 → 필터 → 밝기/대비
    ============================================================ */
 let procChain = Promise.resolve();
@@ -846,7 +965,10 @@ async function processPage(page, maxSide) {
       const dn = (p) => ({ x: p.x * preScale, y: p.y * preScale }); // 원본 좌표 → 다운스케일 좌표
       const sc = { tl: dn(page.corners.tl), tr: dn(page.corners.tr), br: dn(page.corners.br), bl: dn(page.corners.bl) };
       try {
-        if (page.curves) {
+        if (page.model) {
+          // 페이지 모델(곡면+자세) 리맵 → 글줄 직교화 → 트림
+          src = warpModel(src, page.model, { textRect: page.textRect !== false, marginFix: page.marginFix !== false });
+        } else if (page.curves) {
           const cs = mapCurvePoints(page.curves, dn);
           src = warpCurved(src, sc, cs); // 곡선 경계 메시 워프 — 책 곡면까지 폄
         } else {
@@ -1912,6 +2034,9 @@ async function renderEdit() {
   $('sl-contrast').value = page.contrast;
   $('sl-bright-v').textContent = page.bright;
   $('sl-contrast-v').textContent = page.contrast;
+  $('opt-chips').classList.toggle('hidden', !page.model);
+  $('opt-textrect').classList.toggle('active', page.textRect !== false);
+  $('opt-margin').classList.toggle('active', page.marginFix !== false);
   await redrawEdit();
 }
 
@@ -2107,9 +2232,19 @@ function applyCorners(useFull) {
     ? cornerUI.detectedCurves
     : null;
   page.autoChecked = true;
+  page.model = null; // 앵커가 바뀌었으니 모델 재피팅 (그동안은 원근/곡선 보정으로 표시)
   closeCornerModal();
   markDirtyAndRedraw(page);
   toast(useFull ? '전체 영역으로 설정됨' : '문서 영역이 적용됨', { type: 'success', duration: 1500 });
+  if (!useFull && state.cvReady) {
+    makeDetectCanvas(page)
+      .then(({ canvas, scale }) => fitModelForPage(page, canvas, scale))
+      .then(() => {
+        if (page.model && currentPage() === page && state.screen === 'edit') redrawEdit();
+        else if (state.screen === 'gallery') renderGallery();
+      })
+      .catch((e) => console.warn('모델 재피팅 실패', e));
+  }
 }
 
 /* ============================================================
@@ -2277,6 +2412,16 @@ function bindEvents() {
   initCornerHandles();
   $('btn-corner-cancel').onclick = closeCornerModal;
   $('btn-corner-apply').onclick = () => applyCorners(false);
+  // 평탄화 옵션 (책마다 달라 사용자 선택): 글줄 직교화 / 좌측 정렬선 수직 보정
+  const toggleOpt = (key, el) => {
+    const p = currentPage();
+    if (!p) return;
+    p[key] = p[key] === false;
+    el.classList.toggle('active', p[key] !== false);
+    markDirtyAndRedraw(p);
+  };
+  $('opt-textrect').onclick = () => toggleOpt('textRect', $('opt-textrect'));
+  $('opt-margin').onclick = () => toggleOpt('marginFix', $('opt-margin'));
   $('btn-corner-full').onclick = () => applyCorners(true);
   $('btn-corner-auto').onclick = cornerAutoDetect;
   window.addEventListener('resize', () => {

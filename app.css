@@ -665,6 +665,19 @@ main {
   font-weight: 700;
 }
 
+.opt-chips {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.1rem 1rem 0.35rem 1rem;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.opt-chips::-webkit-scrollbar { display: none; }
+.opt-chips .opt-label { flex: none; font-size: 0.72rem; font-weight: 600; color: var(--text-dim); margin-right: 0.15rem; }
+.opt-chips .chip { padding: 0.4rem 0.8rem; font-size: 0.76rem; }
+
 .sliders {
   flex: none;
   display: flex;
