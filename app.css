@@ -361,16 +361,18 @@ main {
   border-left: 3px dashed rgba(244, 63, 94, 0.9);
   filter: drop-shadow(0 0 4px rgba(244, 63, 94, 0.5));
 }
-.frame-guide i {
+/* 좌측 하단 기준점만 표시: 책은 보통 아래를 잡으므로 아래 기준이 가장 중요 (나머지 모서리 꺾쇠는 제거) */
+.frame-guide .bl-anchor {
   position: absolute;
-  width: 28px;
-  height: 28px;
-  border: 3px solid rgba(255, 255, 255, 0.55);
+  bottom: 0;
+  left: -2px;
+  width: 40px;
+  height: 40px;
+  border-left: 3px solid rgba(244, 63, 94, 0.95);
+  border-bottom: 3px solid rgba(244, 63, 94, 0.95);
+  border-radius: 0 0 0 10px;
+  filter: drop-shadow(0 0 5px rgba(244, 63, 94, 0.55));
 }
-.frame-guide i:nth-child(1) { top: 0; left: 0; border-right: 0; border-bottom: 0; border-radius: 8px 0 0 0; }
-.frame-guide i:nth-child(2) { top: 0; right: 0; border-left: 0; border-bottom: 0; border-radius: 0 8px 0 0; }
-.frame-guide i:nth-child(3) { bottom: 0; right: 0; border-left: 0; border-top: 0; border-radius: 0 0 8px 0; }
-.frame-guide i:nth-child(4) { bottom: 0; left: 0; border-right: 0; border-top: 0; border-radius: 0 0 0 8px; }
 
 /* 펼침면 분할 토글 */
 .spread-toggle {

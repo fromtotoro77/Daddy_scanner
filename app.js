@@ -1179,6 +1179,8 @@ function bcInPlace(d, bright, contrast) {
    (정사각 2560×2560 이상값을 주면 가로형 모드가 "가장 가깝다"고 선택되어
    세로 화면에서 가로 프레임이 오는 첫 실행 짤림이 발생 — 방향을 명시해서 방지) */
 function camConstraints() {
+  // 사용자가 고른 카메라 방향을 기억 — 기기에 따라 세로 요청에도 가로 스트림이 오는 경우, 매번 '방향'을 누르지 않게
+  if (state.camFlip === undefined) state.camFlip = localStorage.getItem('ds_camFlip') === '1';
   let portrait = window.innerHeight >= window.innerWidth;
   if (state.camFlip) portrait = !portrait; // 사용자가 회전 버튼으로 방향을 뒤집은 경우
   return {
@@ -1274,6 +1276,7 @@ function startOrientationWatchdog() {
 /* 카메라 방향 수동 전환 — 미리보기가 가로/세로로 잘못 나올 때 사용자가 누름 */
 async function flipCameraOrientation() {
   state.camFlip = !state.camFlip;
+  try { localStorage.setItem('ds_camFlip', state.camFlip ? '1' : '0'); } catch (e) { /* 저장 불가 환경 */ }
   stopCamera();
   await new Promise((r) => setTimeout(r, 300));
   await startCamera();
