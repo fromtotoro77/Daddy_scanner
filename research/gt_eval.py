@@ -153,20 +153,26 @@ JS = """async (arg) => {
     const gd = gF.data;
     const prof = (x0, x1) => {
         const pr = new Float64Array(outH2);
+        const dark = new Uint8Array(outH2);
         for (let y = 0; y < outH2; y++) {
             let s2 = 0;
             for (let x = x0; x < x1; x++) s2 += gd[y * outW2 + x];
             pr[y] = s2 / (x1 - x0);
+            if (pr[y] < 70) dark[y] = 1; // 배경(검은 책상)이 섞인 행 — 글줄 상관에서 제외
         }
-        // 평균 제거
-        const m = pr.reduce((a2, b2) => a2 + b2, 0) / outH2;
-        for (let y = 0; y < outH2; y++) pr[y] -= m;
+        let m = 0, nm = 0;
+        for (let y = 0; y < outH2; y++) if (!dark[y]) { m += pr[y]; nm++; }
+        m = nm ? m / nm : 0;
+        for (let y = 0; y < outH2; y++) pr[y] = dark[y] ? 0 : pr[y] - m;
         return pr;
     };
     const bandC = prof(outW2*0.4|0, outW2*0.6|0);
+    // 글줄이 있는 밴드만 상관 (빈 여백·그림 밴드는 상관이 무의미 → 탐색 한계에 포화)
+    const textRows = (pr) => { let n = 0, inRun = false; for (let y = 0; y < outH2; y++) { const d = pr[y] < -12; if (d && !inRun) n++; inRun = d; } return n; };
     const shifts = [];
     for (const [a2, b2] of [[outW2*0.08|0, outW2*0.28|0], [outW2*0.72|0, outW2*0.92|0]]) {
         const pb = prof(a2, b2);
+        if (textRows(pb) < 4 || textRows(bandC) < 4) continue;
         let bestS = 0, bestC = -1e18;
         for (let sh = -30; sh <= 30; sh++) {
             let cc2 = 0;
@@ -175,7 +181,7 @@ JS = """async (arg) => {
         }
         shifts.push(Math.abs(bestS));
     }
-    const flatShift = Math.max(...shifts) / outH2 * 100; // 출력 높이 대비 %
+    const flatShift = shifts.length ? Math.max(...shifts) / outH2 * 100 : -1; // 출력 높이 대비 % (-1 = 측정 불가)
     // 자기 검증(사용자 제안): 펴진 결과에서 글자 좌측 정렬선의 기울기(90도 이탈각)
     // 행별 "본문 시작 x"(어두운 픽셀 최초 등장)를 상/하 절반에서 중앙값으로 → 기울기
     const textStartX = (y0, y1) => {
