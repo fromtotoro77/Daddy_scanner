@@ -1596,11 +1596,14 @@ function startLiveOverlay() {
           octx.fill();
           octx.stroke();
         }
-        // 고정 중앙 분할선(빨간 점선) — 사용자가 책등을 이 선에 맞추고 촬영
+        // ⊥ 기준선(빨간 점선): 세로 = 책등, 가로(바닥) = 두 페이지의 아래 변 — 사용자가 여기에 맞추고 촬영
         const lineX = ox + (vw * fit) / 2;
+        const lineY = oy + vh * fit * (1 - GUIDE_INSET);
         octx.beginPath();
         octx.moveTo(lineX, oy);
-        octx.lineTo(lineX, oy + vh * fit);
+        octx.lineTo(lineX, lineY);
+        octx.moveTo(ox + vw * fit * GUIDE_INSET, lineY);
+        octx.lineTo(ox + vw * fit * (1 - GUIDE_INSET), lineY);
         octx.strokeStyle = 'rgba(244, 63, 94, 0.95)';
         octx.lineWidth = 3;
         octx.setLineDash([12, 8]);
@@ -1611,7 +1614,7 @@ function startLiveOverlay() {
             hint.textContent = '펼침면 인식됨 — 촬영하면 2페이지로 분할';
             hint.className = 'detect-hint ok';
           } else {
-            hint.textContent = '책등을 빨간 선에 맞추고 촬영하세요';
+            hint.textContent = '책등은 세로 빨간 선, 아래쪽은 가로 빨간 선에 맞추세요';
             hint.className = 'detect-hint';
           }
         }
@@ -1889,9 +1892,11 @@ function detectSpreadQuads(canvas) {
     outerBot: [L ? L.bl.y : null, R ? R.br.y : null],
   };
   const fuse = (pair, def) => { const v = pair.filter((x) => x !== null); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : def; };
-  const spineTop = fuse(obs.spineTop, gy0), spineBot = fuse(obs.spineBot, gy1);
+  // ⊥ 규칙(단일 페이지의 ㄴ과 같은 원칙): 책등 = 세로 빨간 선(x=mid), 아래 변 = 바닥 빨간 선(y=gy1) — 무조건 고정.
+  // 감지는 위 변과 바깥 변만 정하고, 그것도 좌우 대칭으로 융합한다
+  const spineTop = fuse(obs.spineTop, gy0), spineBot = gy1;
   const width = Math.max(W * 0.15, Math.min(mid - 2, fuse(obs.width, mid - gx0)));
-  const outerTop = fuse(obs.outerTop, gy0), outerBot = fuse(obs.outerBot, gy1);
+  const outerTop = fuse(obs.outerTop, gy0), outerBot = gy1;
   const left = { tl: { x: mid - width, y: outerTop }, tr: { x: mid, y: spineTop }, br: { x: mid, y: spineBot }, bl: { x: mid - width, y: outerBot } };
   const right = { tl: { x: mid, y: spineTop }, tr: { x: mid + width, y: outerTop }, br: { x: mid + width, y: outerBot }, bl: { x: mid, y: spineBot } };
   return { left, right, fromDetection: (L ? 1 : 0) + (R ? 1 : 0) };
