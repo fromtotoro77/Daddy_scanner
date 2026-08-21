@@ -165,6 +165,11 @@ JS = """async (arg) => {
     let gF = new cv.Mat(); cv.cvtColor(dstF, gF, cv.COLOR_RGBA2GRAY);
     let rectInfo = null;
     if (window.PM_RECT) {
+        const ang = pmDeskewAngle(gF, outW2, outH2);
+        if (Math.abs(ang) > 0.05 && Math.abs(ang) < 12) {
+            const r0 = pmRotateMat(dstF, ang); dstF.delete(); dstF = r0;
+            gF.delete(); gF = new cv.Mat(); cv.cvtColor(dstF, gF, cv.COLOR_RGBA2GRAY);
+        }
         const rm = pmTextRectifyMaps(gF, outW2, outH2, window.PM_RECT_MARGIN !== false);
         if (rm) {
             const mXr = cv.matFromArray(outH2, outW2, cv.CV_32FC1, Array.from(rm.mapX));
@@ -173,7 +178,7 @@ JS = """async (arg) => {
             dstF.delete(); mXr.delete(); mYr.delete();
             dstF = d2;
             gF.delete(); gF = new cv.Mat(); cv.cvtColor(dstF, gF, cv.COLOR_RGBA2GRAY);
-            rectInfo = { nLines: rm.nLines, maxShift: +rm.maxShift.toFixed(1), nStarts: rm.nStarts };
+            rectInfo = { deskew: +ang.toFixed(2), nLines: rm.nLines, maxShift: +rm.maxShift.toFixed(1) };
         }
     }
     const gd = gF.data;
@@ -274,7 +279,7 @@ with sync_playwright() as p:
     cw = float(os.environ.get("CURV_W", "0"))
     gw = float(os.environ.get("GUIDE_W", "8")); sl = float(os.environ.get("SLACK", "0.015"))
     rw = float(os.environ.get("ROW_W", "0")); fl = os.environ.get("F_LIST", "")
-    pg.evaluate(f"() => {{ window.PM_CURV_W = {cw}; window.PM_GUIDE_W = {gw}; window.PM_SLACK = {sl}; window.PM_ROW_W = {rw}; window.PM_TW_W = {os.environ.get("TW_W", "0")}; window.PM_ROW_W2 = {os.environ.get("ROW_W2", "0")}; window.PM_SOFT_W = {os.environ.get("SOFT_W", "1.0")}; window.PM_TEXT_FIRST = {os.environ.get("TEXT_FIRST", "0")}; window.PM_TL_W = {os.environ.get("TL_W", "0")}; window.PM_RECT = {os.environ.get("RECT", "0")}; window.PM_ROW_SLACK = {os.environ.get("ROW_SLACK", "0.006")}; window.PM_ROW_WPTS = {os.environ.get("ROW_WPTS", "20")}; if ('{fl}') window.PM_F_LIST = [{fl}]; }}")
+    pg.evaluate(f"() => {{ window.PM_CURV_W = {cw}; window.PM_GUIDE_W = {gw}; window.PM_SLACK = {sl}; window.PM_ROW_W = {rw}; window.PM_TW_W = {os.environ.get("TW_W", "0")}; window.PM_ROW_W2 = {os.environ.get("ROW_W2", "0")}; window.PM_SOFT_W = {os.environ.get("SOFT_W", "1.0")}; window.PM_TEXT_FIRST = {os.environ.get("TEXT_FIRST", "0")}; window.PM_TL_W = {os.environ.get("TL_W", "0")}; window.PM_RECT = {os.environ.get("RECT", "0")}; window.PM_RECT_DEG = {os.environ.get("RECT_DEG", "2")}; window.PM_COLFIT = {os.environ.get("COLFIT", "1")}; window.PM_ROW_SLACK = {os.environ.get("ROW_SLACK", "0.006")}; window.PM_ROW_WPTS = {os.environ.get("ROW_WPTS", "20")}; if ('{fl}') window.PM_F_LIST = [{fl}]; }}")
     print(f"== 곡률 {cw} / 앵커 {gw} / 여유 {sl} / 글줄 {rw} / 비틀림페널티 {os.environ.get('TW_W', '0')} / 연경계 {os.environ.get('SOFT_W','1.0')} / 글자우선 {os.environ.get('TEXT_FIRST','0')} / 글줄곡선 {os.environ.get('TL_W','0')} / 직교화 {os.environ.get('RECT','0')} / 2단계글줄 {os.environ.get('ROW_W2', '0')} 여유{os.environ.get('ROW_SLACK','0.006')} 강도{os.environ.get('ROW_WPTS','20')} / F {fl or 0.75} ==")
     tot = {"cur": [], "fit": [], "orc": []}
     only = os.environ.get("ONLY", "")

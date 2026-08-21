@@ -5,7 +5,7 @@
 'use strict';
 
 /* 실험으로 확정한 기본 가중치 (window.PM_* 로 오버라이드 가능 — 채점 하네스용) */
-const PM_DEFAULTS = { PM_CURV_W: 150, PM_TW_W: 900, PM_ROW_W: 30, PM_SOFT_W: 1.0, PM_RECT_DEG: 2 };
+const PM_DEFAULTS = { PM_CURV_W: 150, PM_TW_W: 900, PM_ROW_W: 30, PM_SOFT_W: 1.0, PM_RECT_DEG: 2, PM_COLFIT: 0 };
 function pmFlag(name) {
   if (typeof window !== 'undefined' && window[name] !== undefined) return window[name];
   return PM_DEFAULTS[name];
@@ -670,9 +670,11 @@ function pmTextRectifyMaps(grayMat, w, h, useMargin) {
     // 긴 줄일수록 곡면을 더 강하게 구속 (짧은 줄은 가중 ↓)
     const wgt = Math.min(1, pts.length / 16);
     pts.forEach((p, i) => samples.push({ x: p.x / w, y: p.y / h, r: fitted[i] - m, wgt }));
-    L.push({ m, f, x0: pts[0].x, x1: pts[pts.length - 1].x });
+    L.push({ m, f, x0: pts[0].x, x1: pts[pts.length - 1].x, len: pts[pts.length - 1].x - pts[0].x });
   }
   L.sort((a, b) => a.m - b.m);
+  const maxLen = L.reduce((a, l) => Math.max(a, l.len), 1);
+  for (const l of L) l.wgt = l.len >= 0.8 * maxLen ? 1 : (l.len >= 0.5 * maxLen ? 0.5 : 0.2); // 짧은 줄은 신뢰↓ (Leptonica 80% 규칙 완화)
   if (samples.length < 24) return null;
   // 저차 2D 다항 곡면 d(x,y) = Σ a_ij x^i y^j (i,j ≤ 2) 가중 최소제곱 — 9×9 정규방정식
   // x는 3차(비대칭 말림), y는 2차 — 12항 (PM_RECT_DEG=2면 9항)
@@ -741,9 +743,38 @@ function pmTextRectifyMaps(grayMat, w, h, useMargin) {
   let maxShift = 0;
   const rowDx = new Float32Array(h);
   for (let y = 0; y < h; y++) rowDx[y] = dxAt(y);
+  // Leptonica식 열 단위 피팅: 각 x열에서 (줄 높이 m_i → 보정값) 을 가중 2차 곡선으로 맞추고,
+  // 곡선에서 크게 벗어난 줄(오추출)은 곡선값으로 교체 → 이상치 한 줄이 주변을 끌지 못한다
   const colDev = new Float32Array(L.length);
+  const colRaw = new Float32Array(L.length);
+  const useColFit = pmFlag('PM_COLFIT') !== 0 && L.length >= 4;
+  const colFit = () => {
+    const my = L.reduce((a, l) => a + l.m, 0) / L.length;
+    let s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, t0 = 0, t1 = 0, t2 = 0;
+    for (let i = 0; i < L.length; i++) {
+      const wt = L[i].wgt * (colRaw[i] === colRaw[i] ? 1 : 0);
+      const y = (L[i].m - my) / h, y2 = y * y;
+      s0 += wt; s1 += wt * y; s2 += wt * y2; s3 += wt * y2 * y; s4 += wt * y2 * y2;
+      t0 += wt * colRaw[i]; t1 += wt * y * colRaw[i]; t2 += wt * y2 * colRaw[i];
+    }
+    const det = s0 * (s2 * s4 - s3 * s3) - s1 * (s1 * s4 - s3 * s2) + s2 * (s1 * s3 - s2 * s2);
+    if (Math.abs(det) < 1e-14) return null;
+    const a = (t0 * (s2 * s4 - s3 * s3) - s1 * (t1 * s4 - s3 * t2) + s2 * (t1 * s3 - s2 * t2)) / det;
+    const b = (s0 * (t1 * s4 - s3 * t2) - t0 * (s1 * s4 - s3 * s2) + s2 * (s1 * t2 - t1 * s2)) / det;
+    const c = (s0 * (s2 * t2 - t1 * s3) - s1 * (s1 * t2 - t1 * s2) + t0 * (s1 * s3 - s2 * s2)) / det;
+    return (m) => { const y = (m - my) / h; return a + b * y + c * y * y; };
+  };
   for (let x = 0; x < w; x++) {
-    for (let i = 0; i < L.length; i++) colDev[i] = lineDev(L[i], x);
+    for (let i = 0; i < L.length; i++) colRaw[i] = lineDev(L[i], x);
+    if (useColFit) {
+      const q = colFit();
+      if (q) {
+        const res = L.map((l, i) => Math.abs(colRaw[i] - q(l.m)));
+        const med = [...res].sort((p, r) => p - r)[res.length >> 1] || 0;
+        const thr = Math.max(3, 2.5 * med);
+        for (let i = 0; i < L.length; i++) colDev[i] = res[i] > thr ? q(L[i].m) : colRaw[i];
+      } else for (let i = 0; i < L.length; i++) colDev[i] = colRaw[i];
+    } else for (let i = 0; i < L.length; i++) colDev[i] = colRaw[i];
     let li = 0;
     for (let y = 0; y < h; y++) {
       let d;
