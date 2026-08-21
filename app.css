@@ -361,17 +361,14 @@ main {
   border-left: 3px dashed rgba(244, 63, 94, 0.9);
   filter: drop-shadow(0 0 4px rgba(244, 63, 94, 0.5));
 }
-/* 좌측 하단 기준점만 표시: 책은 보통 아래를 잡으므로 아래 기준이 가장 중요 (나머지 모서리 꺾쇠는 제거) */
-.frame-guide .bl-anchor {
+/* ㄴ 기준선: 세로 점선이 바닥에서 짧은 가로 점선으로 꺾임 — 이 ㄴ 밖으로는 인식하지 않는다 */
+.frame-guide .left-anchor::after {
+  content: '';
   position: absolute;
-  bottom: 0;
-  left: -2px;
-  width: 40px;
-  height: 40px;
-  border-left: 3px solid rgba(244, 63, 94, 0.95);
-  border-bottom: 3px solid rgba(244, 63, 94, 0.95);
-  border-radius: 0 0 0 10px;
-  filter: drop-shadow(0 0 5px rgba(244, 63, 94, 0.55));
+  left: -3px;
+  bottom: -2px;
+  width: 44px;
+  border-bottom: 3px dashed rgba(244, 63, 94, 0.9);
 }
 
 /* 펼침면 분할 토글 */

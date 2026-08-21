@@ -1505,18 +1505,18 @@ function measureFrameQuality(work) {
    - 기준선 오른쪽 4% 이내면 기준선에 스냅, 좌측 하단 모서리는 빨간 꺾쇠(가이드 좌하단)에 스냅
    W,H = 해당 좌표계(감지 캔버스)의 크기 */
 function enforceLeftGuide(q, W, H) {
+  // ㄴ 규칙(사용자 원칙): 왼쪽 변 = 빨간 점선(x=gx0), 아래 변 = 좌하단 꺾쇠의 가로선(y=gy1).
+  // 이 ㄴ 밖으로는 절대 인식하지 않고(초과 → 선으로), 선 근처(12% 이내)면 선에 스냅한다
   const gx0 = W * GUIDE_INSET, gy1 = H * (1 - GUIDE_INSET);
-  const band = W * 0.04;
+  const bandX = W * 0.12, bandY = H * 0.12;
   const out = { tl: { ...q.tl }, tr: { ...q.tr }, br: { ...q.br }, bl: { ...q.bl } };
-  for (const k of ['tl', 'bl']) {
-    if (out[k].x < gx0 + band) out[k].x = gx0; // 왼쪽 초과 → 기준선, 근접 → 스냅
-  }
-  if (Math.abs(out.bl.y - gy1) < H * 0.04 && out.bl.x === gx0) out.bl.y = gy1; // 좌하단 꺾쇠에 스냅
+  for (const k of ['tl', 'bl']) if (out[k].x < gx0 + bandX) out[k].x = gx0;      // 왼쪽 변
+  for (const k of ['bl', 'br']) if (out[k].y > gy1 - bandY) out[k].y = gy1;      // 아래 변
   return out;
 }
-function clampPolyToGuide(poly, W) {
-  const gx0 = W * GUIDE_INSET;
-  for (const p of poly) if (p.x < gx0) p.x = gx0;
+function clampPolyToGuide(poly, W, H) {
+  const gx0 = W * GUIDE_INSET, gy1 = H * (1 - GUIDE_INSET);
+  for (const p of poly) { if (p.x < gx0) p.x = gx0; if (p.y > gy1) p.y = gy1; }
   return poly;
 }
 
@@ -1614,8 +1614,9 @@ function startLiveOverlay() {
         const curves = foundRes.curves || extractCurves(foundRes.contour, foundRes.quad);
         const fixed = enforceLeftGuide(found, work.width, work.height);
         found.tl = fixed.tl; found.bl = fixed.bl;
+        found.br = fixed.br;
         if (curves && curves.left) curves.left = null; // 왼쪽 변은 기준선(직선)
-        const poly = clampPolyToGuide(outlinePolyline(found, curves), work.width);
+        const poly = clampPolyToGuide(outlinePolyline(found, curves), work.width, work.height);
         // 후보 방식이 바뀌어 윤곽이 멀리 점프하면 바로 따라가지 않고 같은 자리가 2번 연속 나올 때만 수용
         const jumpTol = 0.10 * Math.max(work.width, work.height);
         if (liveDetect.poly && liveDetect.hitStreak >= 2 && polyMaxDist(liveDetect.poly, poly) > jumpTol) {
