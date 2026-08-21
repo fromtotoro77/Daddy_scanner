@@ -1507,11 +1507,15 @@ function measureFrameQuality(work) {
 function enforceLeftGuide(q, W, H) {
   // ㄴ 규칙(사용자 원칙): 왼쪽 변 = 빨간 점선(x=gx0), 아래 변 = 좌하단 꺾쇠의 가로선(y=gy1).
   // 이 ㄴ 밖으로는 절대 인식하지 않고(초과 → 선으로), 선 근처(12% 이내)면 선에 스냅한다
+  // "무조건 ㄴ에서 시작": 왼쪽 변은 항상 빨간 선, 아래 변은 항상 바닥선, 좌하단 모서리는 항상 ㄴ 꼭짓점.
+  // 감지는 위쪽 변과 오른쪽 변만 정한다
   const gx0 = W * GUIDE_INSET, gy1 = H * (1 - GUIDE_INSET);
-  const bandX = W * 0.12, bandY = H * 0.12;
   const out = { tl: { ...q.tl }, tr: { ...q.tr }, br: { ...q.br }, bl: { ...q.bl } };
-  for (const k of ['tl', 'bl']) if (out[k].x < gx0 + bandX) out[k].x = gx0;      // 왼쪽 변
-  for (const k of ['bl', 'br']) if (out[k].y > gy1 - bandY) out[k].y = gy1;      // 아래 변
+  out.tl.x = gx0; out.bl.x = gx0; out.bl.y = gy1; out.br.y = gy1;
+  if (out.tl.y > gy1 - H * 0.2) out.tl.y = H * GUIDE_INSET;   // 위 변이 바닥에 붙을 만큼 망가졌으면 가이드 상단으로
+  if (out.tr.x < gx0 + W * 0.2) out.tr.x = W * (1 - GUIDE_INSET); // 오른쪽 변이 왼쪽으로 무너졌으면 가이드 우측으로
+  if (out.br.x < gx0 + W * 0.2) out.br.x = W * (1 - GUIDE_INSET);
+  if (out.tr.y > gy1 - H * 0.2) out.tr.y = H * GUIDE_INSET;
   return out;
 }
 function clampPolyToGuide(poly, W, H) {
