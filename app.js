@@ -2758,8 +2758,12 @@ function bindEvents() {
   startLevelIndicator(false); // 안드로이드는 권한 없이 시작
   $('btn-cam-rotate').onclick = flipCameraOrientation;
   $('btn-spread').classList.toggle('on', state.spreadMode);
+  // 펼침면에서는 ㄴ 기준선 대신 ㅗ(책등 세로선+바닥 가로선, 오버레이에 그림)만 표시
+  const syncGuide = () => document.querySelector('.frame-guide').classList.toggle('hidden', !!state.spreadMode);
+  syncGuide();
   $('btn-spread').onclick = () => {
     state.spreadMode = !state.spreadMode;
+    syncGuide();
     localStorage.setItem('spreadMode', state.spreadMode ? '1' : '0');
     $('btn-spread').classList.toggle('on', state.spreadMode);
     toast(state.spreadMode
