@@ -1281,7 +1281,35 @@ async function flipCameraOrientation() {
 }
 
 /* 실시간 문서 감지 오버레이 — 시간 평활(EMA)로 떨림 억제 + 안정 상태 표시 */
-const liveDetect = { quad: null, hitStreak: 0, missStreak: 0 };
+const liveDetect = { quad: null, poly: null, pending: null, hitStreak: 0, missStreak: 0 };
+
+/* 윤곽을 고정 개수 점(상·하 9, 좌·우 5)으로 재표본 — 프레임 간 1:1 대응이 되어 선 전체를 평활할 수 있다 */
+function resamplePath(pts, n) {
+  if (!pts || pts.length < 2) return null;
+  const seg = [], cum = [0];
+  for (let i = 1; i < pts.length; i++) { seg.push(Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y)); cum.push(cum[i - 1] + seg[i - 1]); }
+  const L = cum[cum.length - 1] || 1;
+  const out = [];
+  for (let k = 0; k < n; k++) {
+    const t = (L * k) / (n - 1);
+    let i = 1; while (i < cum.length - 1 && cum[i] < t) i++;
+    const f = seg[i - 1] ? (t - cum[i - 1]) / seg[i - 1] : 0;
+    out.push({ x: pts[i - 1].x + (pts[i].x - pts[i - 1].x) * f, y: pts[i - 1].y + (pts[i].y - pts[i - 1].y) * f });
+  }
+  return out;
+}
+function outlinePolyline(q, curves) {
+  const top = resamplePath(curves && curves.top ? curves.top : [q.tl, q.tr], 9);
+  const right = resamplePath(curves && curves.right ? curves.right : [q.tr, q.br], 5);
+  const bottom = resamplePath(curves && curves.bottom ? curves.bottom.slice().reverse() : [q.br, q.bl], 9);
+  const left = resamplePath(curves && curves.left ? curves.left.slice().reverse() : [q.bl, q.tl], 5);
+  return [...top, ...right.slice(1), ...bottom.slice(1), ...left.slice(1, -1)];
+}
+function polyMaxDist(a, b) {
+  let m = 0;
+  for (let i = 0; i < Math.min(a.length, b.length); i++) m = Math.max(m, Math.hypot(a[i].x - b[i].x, a[i].y - b[i].y));
+  return m;
+}
 
 function startLiveOverlay() {
   const overlay = $('cam-overlay');
@@ -1344,24 +1372,41 @@ function startLiveOverlay() {
 
       const foundRes = findDocQuad(work, 0.15);
       const found = foundRes ? foundRes.quad : null;
-      liveDetect.curves = foundRes ? (foundRes.curves || extractCurves(foundRes.contour, foundRes.quad)) : null;
       if (found) {
-        liveDetect.hitStreak++;
-        liveDetect.missStreak = 0;
-        // EMA 평활: 이전 위치와 60:40 혼합 → 안내선 떨림 억제
-        if (liveDetect.quad) {
-          const a = 0.4;
-          for (const k of ['tl', 'tr', 'br', 'bl']) {
-            liveDetect.quad[k].x += (found[k].x - liveDetect.quad[k].x) * a;
-            liveDetect.quad[k].y += (found[k].y - liveDetect.quad[k].y) * a;
+        const curves = foundRes.curves || extractCurves(foundRes.contour, foundRes.quad);
+        const poly = outlinePolyline(found, curves);
+        // 후보 방식이 바뀌어 윤곽이 멀리 점프하면 바로 따라가지 않고 같은 자리가 2번 연속 나올 때만 수용
+        const jumpTol = 0.10 * Math.max(work.width, work.height);
+        if (liveDetect.poly && liveDetect.hitStreak >= 2 && polyMaxDist(liveDetect.poly, poly) > jumpTol) {
+          if (liveDetect.pending && polyMaxDist(liveDetect.pending, poly) < jumpTol * 0.5) {
+            liveDetect.poly = poly; liveDetect.quad = found; liveDetect.pending = null; liveDetect.hitStreak = 1;
+          } else {
+            liveDetect.pending = poly; // 한 번 더 확인
           }
         } else {
-          liveDetect.quad = found;
+          liveDetect.pending = null;
+          liveDetect.hitStreak++;
+          if (liveDetect.poly) {
+            // 선 전체 EMA 평활(30%) + 데드밴드(0.4% 프레임 이하 움직임 무시) → 떨림 억제
+            const a = 0.3, dead = 0.004 * Math.max(work.width, work.height);
+            for (let i = 0; i < poly.length; i++) {
+              const dx = poly[i].x - liveDetect.poly[i].x, dy = poly[i].y - liveDetect.poly[i].y;
+              if (Math.hypot(dx, dy) < dead) continue;
+              liveDetect.poly[i].x += dx * a; liveDetect.poly[i].y += dy * a;
+            }
+            for (const k of ['tl', 'tr', 'br', 'bl']) {
+              liveDetect.quad[k].x += (found[k].x - liveDetect.quad[k].x) * a;
+              liveDetect.quad[k].y += (found[k].y - liveDetect.quad[k].y) * a;
+            }
+          } else {
+            liveDetect.poly = poly; liveDetect.quad = found;
+          }
         }
+        liveDetect.missStreak = 0;
       } else {
         liveDetect.hitStreak = 0;
         liveDetect.missStreak++;
-        if (liveDetect.missStreak >= 3) liveDetect.quad = null; // 잠깐 놓친 건 유지
+        if (liveDetect.missStreak >= 4) { liveDetect.quad = null; liveDetect.poly = null; liveDetect.pending = null; } // 잠깐 놓친 건 유지
       }
 
       const cw = overlay.clientWidth, ch = overlay.clientHeight;
@@ -1377,21 +1422,11 @@ function startLiveOverlay() {
         const map = (p) => [(p.x / s) * fit + ox, (p.y / s) * fit + oy];
         const color = stable ? 'rgba(74, 222, 128, 0.95)' : 'rgba(74, 222, 128, 0.45)';
         octx.beginPath();
-        if (liveDetect.curves) {
-          // 곡선 윤곽 가이드: 휘어진 변은 곡선 그대로, 반듯한 변은 직선으로
-          const cvs = liveDetect.curves;
-          const path = [
-            ...cvs.top.map(map),                                  // tl → tr
-            ...(cvs.right || [liveDetect.quad.tr, liveDetect.quad.br]).map(map), // tr → br
-            ...cvs.bottom.slice().reverse().map(map),             // br → bl
-            ...(cvs.left || [liveDetect.quad.tl, liveDetect.quad.bl]).slice().reverse().map(map), // bl → tl
-          ];
+        {
+          // 평활된 윤곽 폴리라인(곡선 포함, 점 개수 고정) 그대로 그림
+          const path = liveDetect.poly.map(map);
           octx.moveTo(path[0][0], path[0][1]);
           for (let i = 1; i < path.length; i++) octx.lineTo(path[i][0], path[i][1]);
-        } else {
-          const pts = ['tl', 'tr', 'br', 'bl'].map((k) => map(liveDetect.quad[k]));
-          octx.moveTo(pts[0][0], pts[0][1]);
-          for (let i = 1; i < 4; i++) octx.lineTo(pts[i][0], pts[i][1]);
         }
         octx.closePath();
         octx.fillStyle = stable ? 'rgba(74, 222, 128, 0.10)' : 'rgba(74, 222, 128, 0.04)';
