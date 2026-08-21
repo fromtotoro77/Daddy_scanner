@@ -1211,13 +1211,16 @@ async function startCamera(isRetry = false) {
     const track = stream.getVideoTracks()[0];
     if (track) {
       await new Promise((r) => setTimeout(r, 250)); // 설정 안정화 대기
+      const orientMismatch = () => {
+        const st = track.getSettings();
+        const screenLandscape = window.innerWidth > window.innerHeight;
+        const vidLandscape = (st.width || 0) > (st.height || 0);
+        return vidLandscape !== screenLandscape; // 화면은 세로인데 프레임이 가로(또는 그 반대)
+      };
       const bad = () => {
         const st = track.getSettings();
         const lowRes = (st.width || 0) * (st.height || 0) < 1200 * 900;
-        let wantLandscape = window.innerWidth > window.innerHeight;
-        if (state.camFlip) wantLandscape = !wantLandscape; // 사용자의 수동 방향 선택 존중
-        const vidLandscape = (st.width || 0) > (st.height || 0);
-        return lowRes || vidLandscape !== wantLandscape;
+        return lowRes || orientMismatch();
       };
       if (bad()) {
         try {
@@ -1225,9 +1228,23 @@ async function startCamera(isRetry = false) {
           await new Promise((r) => setTimeout(r, 300));
         } catch (e) { /* 재협상 미지원 기기 */ }
         if (bad() && !isRetry) {
+          // 방향이 어긋나면 요청을 뒤집어 딱 한 번만 재시작 (세션당 1회 — 반복 재시작 루프 금지).
+          // 성공하면 그 방향을 기억해 다음부터 처음부터 맞게 시작한다
+          const flipNow = orientMismatch() && !state.camAutoFlipTried;
           stopCamera();
           await new Promise((r) => setTimeout(r, 150));
+          if (flipNow) {
+            state.camAutoFlipTried = true;
+            state.camFlip = !state.camFlip;
+            state.camAutoFlipPending = true;
+          }
           return startCamera(true);
+        }
+      }
+      if (state.camAutoFlipPending) {
+        state.camAutoFlipPending = false;
+        if (!orientMismatch()) {
+          try { localStorage.setItem('ds_camFlip', state.camFlip ? '1' : '0'); } catch (e) { /* 저장 불가 환경 */ }
         }
       }
     }
