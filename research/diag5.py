@@ -74,7 +74,7 @@ JS = """async (arg) => {
     const midL = { x: (gtC.tl.x+gtC.bl.x)/2, y: (gtC.tl.y+gtC.bl.y)/2 }; const profL = [];
     for (let d = -80; d <= 60; d += 10) { const x = Math.round(midL.x + d*S), y = Math.round(midL.y); profL.push(x>=0&&x<W ? g[y*W+x] : -1); }
     return { ev, cornerDev, topOff, botOff, leftOff, modelBotEv: evidence(modelBot), modelLeftEv: evidence(modelLeft), botProfile: prof, leftProfile: profL,
-             P: { z1:+P.z1.toFixed(3), z2:+P.z2.toFixed(3), z1b:+(P.z1b??P.z1).toFixed(3), z2b:+(P.z2b??P.z2).toFixed(3), rx:+P.rx.toFixed(3), ry:+P.ry.toFixed(3), rz:+P.rz.toFixed(3) } };
+             P: { tw:+(P.tw||0).toFixed(3), F:P.F, pw:+P.pw.toFixed(3), ph:+P.ph.toFixed(3), rz:+P.rz.toFixed(3), z1:+P.z1.toFixed(3), z2:+P.z2.toFixed(3), z1b:+(P.z1b??P.z1).toFixed(3), z2b:+(P.z2b??P.z2).toFixed(3), rx:+P.rx.toFixed(3), ry:+P.ry.toFixed(3), rz:+P.rz.toFixed(3) } };
 }"""
 with sync_playwright() as p:
     b = p.chromium.launch(); pg = b.new_page(viewport={"width": 500, "height": 900}); pg.set_default_timeout(300000)
@@ -84,7 +84,7 @@ with sync_playwright() as p:
         pg.wait_for_timeout(1000)
     pg.add_script_tag(path=SCRATCH + "/pagemodel.js")
     import os
-    pg.evaluate(f"() => {{ window.PM_CURV_W = {os.environ.get('CURV_W','150')}; window.PM_GUIDE_W = {os.environ.get('GUIDE_W','20')}; window.PM_SLACK = {os.environ.get('SLACK','0.01')}; }}")
+    pg.evaluate(f"() => {{ window.PM_CURV_W = {os.environ.get('CURV_W','150')}; window.PM_GUIDE_W = {os.environ.get('GUIDE_W','20')}; window.PM_SLACK = {os.environ.get('SLACK','0.01')}; window.PM_ROW_W = {os.environ.get('ROW_W','30')}; window.PM_TW_W = {os.environ.get('TW_W','900')}; }}")
     b64 = base64.b64encode(open(rf"C:/python_work/test_photos/{NAME}", "rb").read()).decode()
     r = pg.evaluate(JS, [b64, GT[NAME]])
     for k, v in r.items(): print(k, json.dumps(v, ensure_ascii=False))

@@ -85,7 +85,17 @@ JS = """async (arg) => {
     cnts.delete(); hier.delete(); k3.delete();
     const inv = new cv.Mat(); cv.threshold(clean, inv, 50, 255, cv.THRESH_BINARY_INV);
     const distM = new cv.Mat(); cv.distanceTransform(inv, distM, cv.DIST_L2, 3);
-    const field = { dist: new Float32Array(distM.data32F), gray: new Uint8Array(blur2.data) };
+    // 부드러운 경계장: 강한 블러(σ5) → Sobel 크기 → 상위 1% 기준 정규화
+    const bb = new cv.Mat(); cv.GaussianBlur(gray, bb, new cv.Size(21, 21), 5);
+    const gx = new cv.Mat(), gy = new cv.Mat();
+    cv.Sobel(bb, gx, cv.CV_32F, 1, 0, 3); cv.Sobel(bb, gy, cv.CV_32F, 0, 1, 3);
+    const softArr = new Float32Array(W * H);
+    { const a = gx.data32F, b = gy.data32F; const tmp = [];
+      for (let i = 0; i < W * H; i++) { softArr[i] = Math.hypot(a[i], b[i]); if ((i & 31) === 0) tmp.push(softArr[i]); }
+      tmp.sort((p, q) => p - q); const ref = tmp[Math.floor(tmp.length * 0.99)] || 1;
+      for (let i = 0; i < W * H; i++) softArr[i] = Math.min(1, softArr[i] / ref); }
+    bb.delete(); gx.delete(); gy.delete();
+    const field = { dist: new Float32Array(distM.data32F), gray: new Uint8Array(blur2.data), soft: softArr };
     src.delete(); gray.delete(); blur2.delete(); edges.delete(); clean.delete(); inv.delete(); distM.delete();
 
     const guides = [
@@ -132,7 +142,7 @@ JS = """async (arg) => {
     });
     const initErr = evalOutline(line0(P0, 0), line0(P0, 1), side0(P0, 0), side0(P0, 1));
     const r3x = pmFitMulti(field, W, H, gtGuide, P0);
-    const P3 = r3x.P;
+    const P3 = (window.PM_ROW_W2 > 0) ? pmRefineInterior(field, W, H, r3x.P, window.PM_ROW_W2, window.PM_ROW_SLACK || 0.006, window.PM_ROW_WPTS || 20) : r3x.P;
     const oracleErr = evalOutline(line0(P3, 0), line0(P3, 1), side0(P3, 0), side0(P3, 1));
     // 변별 오차 분해
     const edgeErr = {};
@@ -143,7 +153,9 @@ JS = """async (arg) => {
     }
 
     // 평탄화 품질 자동 측정: 펴진 결과에서 좌/중/우 세로 명암 프로파일의 상호 시프트(글줄 어긋남)
-    const outW2 = 420, outH2 = 560;
+    const outH2 = 560, outW2 = Math.max(120, Math.round(outH2 * pmFlatAspect(P3)));
+    const bboxAspect = (gtGuide.x1 - gtGuide.x0) / (gtGuide.y1 - gtGuide.y0);
+    const aspectFix = +(pmFlatAspect(P3) / bboxAspect).toFixed(3); // 1보다 크면 기존 출력이 가로로 눌려 있었음
     const rm2 = pmBuildRemap(P3, W, H, outW2, outH2);
     const mX2 = cv.matFromArray(outH2, outW2, cv.CV_32FC1, Array.from(rm2.mapX));
     const mY2 = cv.matFromArray(outH2, outW2, cv.CV_32FC1, Array.from(rm2.mapY));
@@ -182,6 +194,32 @@ JS = """async (arg) => {
         shifts.push(Math.abs(bestS));
     }
     const flatShift = shifts.length ? Math.max(...shifts) / outH2 * 100 : -1; // 출력 높이 대비 % (-1 = 측정 불가)
+    const stripShift = [];
+    const NSTRIP = 5;
+    for (let k = 0; k < NSTRIP; k++) {
+        const a3 = Math.round(outW2 * (0.06 + 0.88 * k / NSTRIP)), b3 = Math.round(outW2 * (0.06 + 0.88 * (k + 1) / NSTRIP));
+        const ps = prof(a3, b3);
+        if (textRows(ps) < 4 || textRows(bandC) < 4) { stripShift.push(null); continue; }
+        let bestS = 0, bestC = -1e18;
+        for (let sh = -40; sh <= 40; sh++) {
+            let cc2 = 0;
+            for (let y = Math.max(0, -sh); y < Math.min(outH2, outH2 - sh); y++) cc2 += bandC[y] * ps[y + sh];
+            if (cc2 > bestC) { bestC = cc2; bestS = sh; }
+        }
+        stripShift.push(bestS);
+    }
+    // 유효 띠의 (x, shift) 직선 피팅 → 글줄 기울기(도), 잔차 최대(px) = 곡선 잔류
+    const xsS = [], ysS = [];
+    stripShift.forEach((s3, k) => { if (s3 !== null) { xsS.push(outW2 * (0.06 + 0.88 * (k + 0.5) / NSTRIP)); ysS.push(s3); } });
+    let lineTilt = -1, lineBow = -1;
+    if (xsS.length >= 3) {
+        const mx = xsS.reduce((a2,b2)=>a2+b2,0)/xsS.length, my = ysS.reduce((a2,b2)=>a2+b2,0)/ysS.length;
+        let sxy = 0, sxx = 0;
+        for (let i = 0; i < xsS.length; i++) { sxy += (xsS[i]-mx)*(ysS[i]-my); sxx += (xsS[i]-mx)*(xsS[i]-mx); }
+        const slope = sxx ? sxy / sxx : 0;
+        lineTilt = +(Math.atan(slope) * 180 / Math.PI).toFixed(2);
+        lineBow = Math.max(...xsS.map((x3, i) => Math.abs(ysS[i] - (my + slope * (x3 - mx)))));
+    }
     // 자기 검증(사용자 제안): 펴진 결과에서 글자 좌측 정렬선의 기울기(90도 이탈각)
     // 행별 "본문 시작 x"(어두운 픽셀 최초 등장)를 상/하 절반에서 중앙값으로 → 기울기
     const textStartX = (y0, y1) => {
@@ -204,7 +242,7 @@ JS = """async (arg) => {
     srcF.delete(); dstF.delete(); gF.delete(); mX2.delete(); mY2.delete();
 
     return { curErr: curErr === null ? -1 : +curErr.toFixed(1), fitErr: +fitErr.toFixed(1), initErr: +initErr.toFixed(1), oracleErr: +oracleErr.toFixed(1),
-             flatShift: +flatShift.toFixed(2), edgeErr, marginSlant: marginSlant < 0 ? -1 : +marginSlant.toFixed(1),
+             flatShift: +flatShift.toFixed(2), edgeErr, aspectFix, lineTilt, lineBow, stripShift, marginSlant: marginSlant < 0 ? -1 : +marginSlant.toFixed(1),
              Pz: { z1:+P3.z1.toFixed(2), z2:+P3.z2.toFixed(2), z1b:+(P3.z1b??P3.z1).toFixed(2), z2b:+(P3.z2b??P3.z2).toFixed(2), rx:+P3.rx.toFixed(2), ry:+P3.ry.toFixed(2) } };
 }"""
 
@@ -221,16 +259,20 @@ with sync_playwright() as p:
     import os
     cw = float(os.environ.get("CURV_W", "0"))
     gw = float(os.environ.get("GUIDE_W", "8")); sl = float(os.environ.get("SLACK", "0.015"))
-    pg.evaluate(f"() => {{ window.PM_CURV_W = {cw}; window.PM_GUIDE_W = {gw}; window.PM_SLACK = {sl}; }}")
-    print(f"== 곡률 {cw} / 앵커 {gw} / 여유 {sl} ==")
+    rw = float(os.environ.get("ROW_W", "0")); fl = os.environ.get("F_LIST", "")
+    pg.evaluate(f"() => {{ window.PM_CURV_W = {cw}; window.PM_GUIDE_W = {gw}; window.PM_SLACK = {sl}; window.PM_ROW_W = {rw}; window.PM_TW_W = {os.environ.get("TW_W", "0")}; window.PM_ROW_W2 = {os.environ.get("ROW_W2", "0")}; window.PM_SOFT_W = {os.environ.get("SOFT_W", "0")}; window.PM_ROW_SLACK = {os.environ.get("ROW_SLACK", "0.006")}; window.PM_ROW_WPTS = {os.environ.get("ROW_WPTS", "20")}; if ('{fl}') window.PM_F_LIST = [{fl}]; }}")
+    print(f"== 곡률 {cw} / 앵커 {gw} / 여유 {sl} / 글줄 {rw} / 비틀림페널티 {os.environ.get('TW_W', '0')} / 연경계 {os.environ.get('SOFT_W','0')} / 2단계글줄 {os.environ.get('ROW_W2', '0')} 여유{os.environ.get('ROW_SLACK','0.006')} 강도{os.environ.get('ROW_WPTS','20')} / F {fl or 0.75} ==")
     tot = {"cur": [], "fit": [], "orc": []}
+    only = os.environ.get("ONLY", "")
     for name in GT.keys():
+        if only and name != only: continue
         with open(rf"C:/python_work/test_photos/{name}", "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
         r = pg.evaluate(JS, [b64, GT[name]])
-        print(f"[{name}] 외곽={r['oracleErr']}px (상{r['edgeErr']['top']}/하{r['edgeErr']['bot']}/좌{r['edgeErr']['left']}/우{r['edgeErr']['right']}) 시프트={r['flatShift']}% 여백기울기={r['marginSlant']}도")
+        print(f"[{name}] 외곽={r['oracleErr']}px (상{r['edgeErr']['top']}/하{r['edgeErr']['bot']}/좌{r['edgeErr']['left']}/우{r['edgeErr']['right']}) 시프트={r['flatShift']}% 글줄기울기={r['lineTilt']}도 글줄휨={r['lineBow']}px 띠시프트={r['stripShift']} 비율보정={r['aspectFix']}")
         if r["curErr"] >= 0: tot["cur"].append(r["curErr"])
         tot["fit"].append(r["fitErr"]); tot["orc"].append(r["oracleErr"]); tot.setdefault("ini", []).append(r["initErr"])
-    print(f"평균: 기존={sum(tot['cur'])/len(tot['cur']):.1f}  피팅={sum(tot['fit'])/4:.1f}  init만={sum(tot['ini'])/4:.1f}  신뢰영역={sum(tot['orc'])/4:.1f} px")
+    if len(tot['orc']) == 0: pass
+    else: print(f"평균: 기존={sum(tot['cur'])/len(tot['cur']):.1f}  피팅={sum(tot['fit'])/4:.1f}  init만={sum(tot['ini'])/4:.1f}  신뢰영역={sum(tot['orc'])/4:.1f} px")
     b.close()
 server.shutdown()

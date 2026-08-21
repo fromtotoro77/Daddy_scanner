@@ -47,7 +47,16 @@ JS = """async (arg) => {
     cnts.delete(); hier.delete(); k3.delete();
     const inv = new cv.Mat(); cv.threshold(clean, inv, 50, 255, cv.THRESH_BINARY_INV);
     const distM = new cv.Mat(); cv.distanceTransform(inv, distM, cv.DIST_L2, 3);
-    const field = { dist: new Float32Array(distM.data32F), gray: new Uint8Array(blur2.data) };
+    const bb = new cv.Mat(); cv.GaussianBlur(gray, bb, new cv.Size(21, 21), 5);
+    const gx = new cv.Mat(), gy = new cv.Mat();
+    cv.Sobel(bb, gx, cv.CV_32F, 1, 0, 3); cv.Sobel(bb, gy, cv.CV_32F, 0, 1, 3);
+    const softArr = new Float32Array(W * H);
+    { const a = gx.data32F, b = gy.data32F; const tmp = [];
+      for (let i = 0; i < W * H; i++) { softArr[i] = Math.hypot(a[i], b[i]); if ((i & 31) === 0) tmp.push(softArr[i]); }
+      tmp.sort((p, q) => p - q); const ref = tmp[Math.floor(tmp.length * 0.99)] || 1;
+      for (let i = 0; i < W * H; i++) softArr[i] = Math.min(1, softArr[i] / ref); }
+    bb.delete(); gx.delete(); gy.delete();
+    const field = { dist: new Float32Array(distM.data32F), gray: new Uint8Array(blur2.data), soft: softArr };
     src.delete(); gray.delete(); blur2.delete(); edges.delete(); clean.delete(); inv.delete(); distM.delete();
 
     // 정렬 초기화 + 신뢰영역 피팅
@@ -61,7 +70,7 @@ JS = """async (arg) => {
     gtGuide.anchorC = gtC;
     gtGuide.slack = 0.01 * Math.max(W, H);
     gtGuide.w = 20;
-    const { P } = pmFitMulti(field, W, H, gtGuide, P0);
+    const P = pmRefineInterior(field, W, H, pmFitMulti(field, W, H, gtGuide, P0).P, 300, 0.003, 60);
 
     // 시각화
     const ctx = dc.getContext('2d');
@@ -87,8 +96,8 @@ JS = """async (arg) => {
     drawPoly(mside(1), 'rgba(244,63,94,0.95)', 2);
 
     // 평탄화
-    const outW = Math.round(gtGuide.x1 - gtGuide.x0);
     const outH = Math.round(gtGuide.y1 - gtGuide.y0);
+    const outW = Math.max(60, Math.round(outH * pmFlatAspect(P))); // 화면 bbox가 아니라 모델의 실제 페이지 비율
     const rm = pmBuildRemap(P, W, H, outW, outH);
     const mX = cv.matFromArray(outH, outW, cv.CV_32FC1, Array.from(rm.mapX));
     const mY = cv.matFromArray(outH, outW, cv.CV_32FC1, Array.from(rm.mapY));
@@ -98,8 +107,12 @@ JS = """async (arg) => {
     const src2 = cv.imread(src2raw);
     const dst = new cv.Mat();
     cv.remap(src2, dst, mX, mY, cv.INTER_LINEAR, cv.BORDER_REPLICATE);
+    // 테두리 배경 띠 제거
+    const gF = new cv.Mat(); cv.cvtColor(dst, gF, cv.COLOR_RGBA2GRAY);
+    const tb = pmTrimDarkBorders(gF.data, outW, outH); gF.delete();
+    const roi = dst.roi(new cv.Rect(tb.x0, tb.y0, tb.x1 - tb.x0, tb.y1 - tb.y0));
     const oc = document.createElement('canvas');
-    cv.imshow(oc, dst);
+    cv.imshow(oc, roi); roi.delete();
     src2.delete(); dst.delete(); mX.delete(); mY.delete();
 
     return { viz: dc.toDataURL('image/jpeg', 0.85), out: oc.toDataURL('image/jpeg', 0.88) };
@@ -115,7 +128,7 @@ with sync_playwright() as p:
             break
         pg.wait_for_timeout(1000)
     pg.add_script_tag(path=SCRATCH + "/pagemodel.js")
-    pg.evaluate("() => window.PM_CURV_W = 150")
+    pass  # 엔진 기본값 사용
     for idx, name in enumerate(GT.keys(), 1):
         with open(rf"C:/python_work/test_photos/{name}", "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
@@ -146,5 +159,5 @@ W = max(r.width for r in rows); H = sum(r.height for r in rows) + 12 * len(rows)
 s = Image.new('RGB', (W, H), (12, 12, 14)); y = 0
 for r in rows:
     s.paste(r, (0, y)); y += r.height + 12
-s.save('C:/python_work/test_photos/trustfit_v8_align.jpg', quality=88)
+s.save('C:/python_work/test_photos/trustfit_v11_final.jpg', quality=88)
 print('sheet saved')

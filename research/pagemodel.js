@@ -4,6 +4,13 @@
    안내선 = 이 모델의 투영 외곽선 → 물리적으로 가능한 책 모양만 허용됨 */
 'use strict';
 
+/* 실험으로 확정한 기본 가중치 (window.PM_* 로 오버라이드 가능 — 채점 하네스용) */
+const PM_DEFAULTS = { PM_CURV_W: 150, PM_TW_W: 900, PM_ROW_W: 30, PM_SOFT_W: 1.0 };
+function pmFlag(name) {
+  if (typeof window !== 'undefined' && window[name] !== undefined) return window[name];
+  return PM_DEFAULTS[name];
+}
+
 /* 단면 곡률: z(u) = 3(1-u)²u·z1 + 3(1-u)u²·z2  (페이지 폭 단위) */
 function pmBez(u, z1, z2) {
   const iu = 1 - u;
@@ -21,6 +28,8 @@ function pmProject(P, u, v, W, H) {
   const zb1 = P.z1b === undefined ? z1 : P.z1b;
   const zb2 = P.z2b === undefined ? z2 : P.z2b;
   let Z = ((1 - v) * pmBez(u, z1, z2) + v * pmBez(u, zb1, zb2)) * pw;
+  // 비틀림(쌍곡포물면): 네 모서리가 한 평면에 있지 않은 책장 — 모서리 정합의 8번째 자유도
+  if (P.tw) Z += P.tw * (u - 0.5) * (v - 0.5) * pw;
   // 회전 (pitch=rx, yaw=ry, roll=rz)
   let x1 = X, y1 = Y * Math.cos(rx) - Z * Math.sin(rx), z1r = Y * Math.sin(rx) + Z * Math.cos(rx);
   let x2 = x1 * Math.cos(ry) + z1r * Math.sin(ry), y2 = y1, z2r = -x1 * Math.sin(ry) + z1r * Math.cos(ry);
@@ -75,15 +84,72 @@ function pmScore(P, fieldObj, W, H, guide) {
       s -= guide.w * Math.max(0, dev - guide.slack);
     }
   }
+  // 부드러운 경계 증거(그림자 경사·저대비 종이/책상 경계): 강한 블러 후 그라디언트 크기(0~1)
+  const sw = pmFlag('PM_SOFT_W');
+  if (sw && fieldObj.soft) {
+    const sf = fieldObj.soft;
+    for (const p of pts) {
+      const x = p[0], y = p[1];
+      if (x < 1 || y < 1 || x >= W - 1 || y >= H - 1) continue;
+      const x0 = Math.floor(x), y0 = Math.floor(y), fx = x - x0, fy = y - y0;
+      const v = sf[y0 * W + x0] * (1 - fx) * (1 - fy) + sf[y0 * W + x0 + 1] * fx * (1 - fy) + sf[(y0 + 1) * W + x0] * (1 - fx) * fy + sf[(y0 + 1) * W + x0 + 1] * fx * fy;
+      s += sw * 25 * v;
+    }
+  }
+  // 외곽선 전체 앵커 (2단계: 1단계가 확정한 외곽을 유지한 채 내부 글줄로 자세 모호성만 해소)
+  if (guide && guide.anchorPts) {
+    const ap = guide.anchorPts;
+    for (let i = 0; i < pts.length && i < ap.length; i++) {
+      if (!pts[i] || !ap[i]) continue;
+      const dev = Math.hypot(pts[i][0] - ap[i][0], pts[i][1] - ap[i][1]);
+      s -= guide.wPts * Math.max(0, dev - guide.slackPts);
+    }
+  }
   // 곡률 오컴 페널티: 증거가 밀어붙이지 않는 한 직선 유지 (평면 문서 과곡률 방지)
-  const cw = (typeof window !== 'undefined' && window.PM_CURV_W) ? window.PM_CURV_W : 0;
+  const cw = pmFlag('PM_CURV_W');
   if (cw) s -= cw * (Math.abs(P.z1) + Math.abs(P.z2) + Math.abs(P.z1b ?? P.z1) + Math.abs(P.z2b ?? P.z2));
+  const tww = pmFlag('PM_TW_W');
+  if (tww && P.tw) s -= tww * Math.abs(P.tw); // 비틀림 오컴 페널티 (평평한 문서에서 남용 방지)
   if (fieldObj.gray) {
     s += 1.6 * pmInteriorScore(P, fieldObj.gray, W, H); // 글자 줄 정합
     s += 0.45 * pmPolarityScore(P, fieldObj.gray, W, H); // 극성: 안쪽 밝음→바깥 어두움 전이 보상
     s += 1.2 * pmMarginScore(P, fieldObj.gray, W, H); // 세로 여백 정합 (글자 기울기 90도)
+    const rw = (guide && guide.rowW !== undefined) ? guide.rowW : pmFlag('PM_ROW_W');
+    if (rw) s += rw * pmRowScore(P, fieldObj.gray, W, H); // 글줄 수평 (자세·F 모호성 해소)
   }
   return s;
+}
+
+/* 글줄 수평 점수(사용자 제안 "글자의 줄과 줄은 수평"): 모델 (u,v) 격자에서 각 v행의 평균 밝기
+   프로파일을 구해 그 대비(표준편차)를 잰다. 글줄이 v=일정 선에 정확히 놓이면 행 평균이
+   줄/간격으로 또렷이 갈려 대비↑, 자세·곡률이 틀려 글줄이 기울거나 휘면 행끼리 섞여 대비↓.
+   외곽만으로는 구분 안 되는 자세(F·요·롤) 모호성을 내부 글자로 푼다 */
+function pmRowScore(P, gray, W, H) {
+  const NR = 56, NC = 24;
+  const rows = [];
+  for (let r = 0; r < NR; r++) {
+    const v = 0.12 + (0.76 * r) / (NR - 1);
+    let s = 0, n = 0;
+    for (let c = 0; c < NC; c++) {
+      const u = 0.12 + (0.76 * c) / (NC - 1);
+      const p = pmProject(P, u, v, W, H);
+      if (!p) return -1e9;
+      const x = Math.round(p[0]), y = Math.round(p[1]);
+      if (x < 0 || y < 0 || x >= W || y >= H) continue;
+      s += gray[y * W + x]; n++;
+    }
+    if (n >= NC * 0.7) rows.push(s / n);
+  }
+  if (rows.length < NR * 0.7) return 0;
+  // 저주파(조명 그라데이션) 제거: 이웃 9행 이동평균 차감 후 표준편차
+  let tot = 0, cnt = 0;
+  for (let i = 4; i < rows.length - 4; i++) {
+    let m = 0;
+    for (let k = -4; k <= 4; k++) m += rows[i + k];
+    const d = rows[i] - m / 9;
+    tot += d * d; cnt++;
+  }
+  return cnt ? Math.sqrt(tot / cnt) : 0;
 }
 
 /* 극성 점수: 외곽선 각 점에서 바깥 법선 방향으로 안/밖 밝기를 비교.
@@ -165,12 +231,13 @@ function pmFit(grad, W, H, guide, initP, stepScale = 1) {
   const P = { ...initP };
   if (P.z1b === undefined) P.z1b = P.z1;
   if (P.z2b === undefined) P.z2b = P.z2;
-  const names = ['tx', 'ty', 'pw', 'ph', 'rx', 'ry', 'rz', 'z1', 'z2', 'z1b', 'z2b'];
+  if (P.tw === undefined) P.tw = 0;
+  const names = ['tx', 'ty', 'pw', 'ph', 'rx', 'ry', 'rz', 'z1', 'z2', 'z1b', 'z2b', 'tw'];
   const step0 = {};
-  for (const [k, v] of Object.entries({ tx: 0.04, ty: 0.04, pw: 0.05, ph: 0.05, rx: 0.05, ry: 0.05, rz: 0.02, z1: 0.03, z2: 0.03, z1b: 0.03, z2b: 0.03 })) {
+  for (const [k, v] of Object.entries({ tx: 0.04, ty: 0.04, pw: 0.05, ph: 0.05, rx: 0.05, ry: 0.05, rz: 0.02, z1: 0.03, z2: 0.03, z1b: 0.03, z2b: 0.03, tw: 0.03 })) {
     step0[k] = v * stepScale;
   }
-  const lim = { z1: [-0.5, 0.5], z2: [-0.5, 0.5], z1b: [-0.5, 0.5], z2b: [-0.5, 0.5], rx: [-0.6, 0.6], ry: [-0.6, 0.6], rz: [-0.35, 0.35] };
+  const lim = { z1: [-0.5, 0.5], z2: [-0.5, 0.5], z1b: [-0.5, 0.5], z2b: [-0.5, 0.5], rx: [-0.6, 0.6], ry: [-0.6, 0.6], rz: [-0.35, 0.35], tw: [-0.4, 0.4] };
   let best = pmScore(P, grad, W, H, guide);
   for (let round = 0; round < 60; round++) {
     let improved = false;
@@ -217,7 +284,7 @@ function pmFitMulti(field, W, H, guide, baseInit) {
   // 최적해의 곡률을 뒤집어 다시 맞춰보고 더 좋은 쪽을 택한다
   {
     const bp = bestR.P;
-    const flipped = { ...bp, z1: -bp.z1, z2: -bp.z2, z1b: -(bp.z1b ?? bp.z1), z2b: -(bp.z2b ?? bp.z2) };
+    const flipped = { ...bp, z1: -bp.z1, z2: -bp.z2, z1b: -(bp.z1b ?? bp.z1), z2b: -(bp.z2b ?? bp.z2), tw: -(bp.tw || 0) };
     const r = pmFit(field, W, H, guide, flipped);
     if (r.score > bestR.score) bestR = r;
   }
@@ -295,10 +362,10 @@ function pmAlignToQuad(targetC, W, H, baseInit) {
          + Math.hypot(c[2][0]-targetC.br.x, c[2][1]-targetC.br.y) + Math.hypot(c[3][0]-targetC.bl.x, c[3][1]-targetC.bl.y);
   };
   // 좌표하강 다듬기 (출발점마다 독립 실행)
-  const names = ['tx', 'ty', 'pw', 'ph', 'rx', 'ry', 'rz'];
-  const step0 = { tx: 0.05, ty: 0.05, pw: 0.06, ph: 0.06, rx: 0.08, ry: 0.08, rz: 0.05 };
+  const names = ['tx', 'ty', 'pw', 'ph', 'rx', 'ry', 'rz', 'tw'];
+  const step0 = { tx: 0.05, ty: 0.05, pw: 0.06, ph: 0.06, rx: 0.08, ry: 0.08, rz: 0.05, tw: 0.05 };
   const descend = (start, scale) => {
-    const P = { ...start };
+    const P = { ...start, tw: start.tw || 0 };
     let best = quadLoss(P);
     for (let round = 0; round < 70; round++) {
       let improved = false;
@@ -309,6 +376,7 @@ function pmAlignToQuad(targetC, W, H, baseInit) {
           for (let hop = 0; hop < 6; hop++) {
             const old = P[k];
             P[k] = old + dir * st;
+            if (k === 'tw' && Math.abs(P[k]) > 0.35) { P[k] = old; break; } // 피팅 단계 한계와 일치 (밖으로 나가면 영구 고착)
             const s = quadLoss(P);
             if (s < best) { best = s; improved = true; moved = true; }
             else { P[k] = old; break; }
@@ -323,8 +391,11 @@ function pmAlignToQuad(targetC, W, H, baseInit) {
   // 출발점 후보: 평면 정면 초기값 + F 후보별 해석적 자세(호모그래피 분해).
   // 말린 페이지의 모서리는 한 평면에 있지 않아 해석해에도 잔차가 남으므로,
   // 각 출발점에서 다듬은 뒤 잔차 최소를 택한다
-  const starts = [{ P: { ...baseInit, z1: 0, z2: 0 }, scale: 1 }];
-  for (const fm of [0.8, 1.0, 1.15, 1.4, 1.8, 2.4]) {
+  const starts = [{ P: { ...baseInit, z1: 0, z2: 0, F: PM_F_DEFAULT * Math.max(W, H) }, scale: 1 }];
+  // F는 네 모서리만으로 정할 수 없다(평면 사각형은 모든 F에서 잔차 동일, 곡면은 엉뚱한 F가 최소)
+  // → 스마트폰 기본 카메라 물리값(26mm 환산 ≈ 0.75×장변)으로 고정
+  const fList = (typeof window !== 'undefined' && window.PM_F_LIST) ? window.PM_F_LIST : [PM_F_DEFAULT];
+  for (const fm of fList) {
     const Q = pmPoseFromQuad(targetC, W, H, fm * Math.max(W, H));
     if (Q && quadLoss(Q) < 1e8) starts.push({ P: Q, scale: 0.4 });
   }
@@ -337,8 +408,9 @@ function pmAlignToQuad(targetC, W, H, baseInit) {
 }
 
 /* 초기값: 가이드 사각형(평평·정면 가정)에서 역산 */
+const PM_F_DEFAULT = 0.75;
 function pmInit(guide, W, H) {
-  const F = 1.15 * Math.max(W, H);
+  const F = PM_F_DEFAULT * Math.max(W, H);
   return {
     F,
     tx: ((guide.x0 + guide.x1) / 2 - W / 2) / F,
@@ -347,6 +419,53 @@ function pmInit(guide, W, H) {
     ph: (guide.y1 - guide.y0) / F,
     rx: 0, ry: 0, rz: 0, z1: 0, z2: 0,
   };
+}
+
+/* 2단계 내부 정밀화: 1단계 외곽을 앵커로 고정하고(여유 slackPts), 글줄 수평 항을 강하게 켜서
+   외곽이 같은 자세 족(F·요·비틀림·곡률 교환) 중 글자가 수평이 되는 해를 고른다 */
+function pmRefineInterior(field, W, H, P1, rowW = 100, slackFrac = 0.006, wPts = 20) {
+  const guide = { anchorPts: pmOutline(P1, W, H), slackPts: slackFrac * Math.max(W, H), wPts, rowW };
+  let cur = { P: { ...P1 }, score: pmScore(P1, field, W, H, guide) };
+  for (const sc of [0.5, 0.2, 0.08]) {
+    const r = pmFit(field, W, H, guide, cur.P, sc);
+    if (r.score > cur.score) cur = r;
+  }
+  return cur.P;
+}
+
+/* 평탄화 결과의 테두리 다듬기: 외곽이 실제 경계보다 조금 바깥이면 가장자리에 책상/배경 띠가 남는다.
+   가장자리에서 안쪽으로, 종이 밝기(중앙 중앙값)보다 확연히 어두운 행/열을 잘라낸다 (최대 8%) */
+function pmTrimDarkBorders(gray, w, h) {
+  const cx0 = Math.round(w * 0.3), cx1 = Math.round(w * 0.7), cy0 = Math.round(h * 0.3), cy1 = Math.round(h * 0.7);
+  const samp = [];
+  for (let y = cy0; y < cy1; y += 3) for (let x = cx0; x < cx1; x += 3) samp.push(gray[y * w + x]);
+  samp.sort((a, b) => a - b);
+  const paper = samp[Math.floor(samp.length * 0.7)]; // 글자 제외한 종이 밝기
+  const thr = paper - 55;
+  const colMean = (x) => { let s = 0; for (let y = cy0; y < cy1; y++) s += gray[y * w + x]; return s / (cy1 - cy0); };
+  const rowMean = (y) => { let s = 0; for (let x = cx0; x < cx1; x++) s += gray[y * w + x]; return s / (cx1 - cx0); };
+  const maxX = Math.round(w * 0.08), maxY = Math.round(h * 0.08);
+  let x0 = 0, x1 = w, y0 = 0, y1 = h;
+  while (x0 < maxX && colMean(x0) < thr) x0++;
+  while (w - x1 < maxX && colMean(x1 - 1) < thr) x1--;
+  while (y0 < maxY && rowMean(y0) < thr) y0++;
+  while (h - y1 < maxY && rowMean(y1 - 1) < thr) y1--;
+  // 어두운 띠 다음의 1~2px 전이도 함께 제거
+  if (x0) x0 = Math.min(maxX, x0 + 2); if (x1 < w) x1 = Math.max(w - maxX, x1 - 2);
+  if (y0) y0 = Math.min(maxY, y0 + 2); if (y1 < h) y1 = Math.max(h - maxY, y1 - 2);
+  return { x0, x1, y0, y1 };
+}
+
+/* 펴진 페이지의 실제 가로/세로 비율: 중간 행 단면 호길이 × pw / ph
+   (출력 크기를 화면 바운딩박스로 잡으면 원근으로 좁아진 만큼 글자가 눌린다) */
+function pmFlatAspect(P) {
+  const zb1 = P.z1b === undefined ? P.z1 : P.z1b;
+  const zb2 = P.z2b === undefined ? P.z2 : P.z2b;
+  const c1 = 0.5 * (P.z1 + zb1), c2 = 0.5 * (P.z2 + zb2);
+  const N = 120;
+  let arc = 0, pz = pmBez(0, c1, c2);
+  for (let i = 1; i <= N; i++) { const z = pmBez(i / N, c1, c2); arc += Math.hypot(1 / N, z - pz); pz = z; }
+  return (P.pw * arc) / P.ph;
 }
 
 /* 평탄화 리맵: 출력 (U,V) → 원본 좌표.
