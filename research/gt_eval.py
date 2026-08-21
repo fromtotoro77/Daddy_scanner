@@ -142,7 +142,7 @@ JS = """async (arg) => {
     });
     const initErr = evalOutline(line0(P0, 0), line0(P0, 1), side0(P0, 0), side0(P0, 1));
     const r3x = pmFitMulti(field, W, H, gtGuide, P0);
-    const P3 = (window.PM_ROW_W2 > 0) ? pmRefineInterior(field, W, H, r3x.P, window.PM_ROW_W2, window.PM_ROW_SLACK || 0.006, window.PM_ROW_WPTS || 20) : r3x.P;
+    const P3 = (window.PM_TEXT_FIRST) ? pmFitTextFirst(field, W, H, gtC, P0, window.PM_TEXT_FIRST) : (window.PM_ROW_W2 > 0) ? pmRefineInterior(field, W, H, r3x.P, window.PM_ROW_W2, window.PM_ROW_SLACK || 0.006, window.PM_ROW_WPTS || 20) : r3x.P;
     const oracleErr = evalOutline(line0(P3, 0), line0(P3, 1), side0(P3, 0), side0(P3, 1));
     // 변별 오차 분해
     const edgeErr = {};
@@ -260,8 +260,8 @@ with sync_playwright() as p:
     cw = float(os.environ.get("CURV_W", "0"))
     gw = float(os.environ.get("GUIDE_W", "8")); sl = float(os.environ.get("SLACK", "0.015"))
     rw = float(os.environ.get("ROW_W", "0")); fl = os.environ.get("F_LIST", "")
-    pg.evaluate(f"() => {{ window.PM_CURV_W = {cw}; window.PM_GUIDE_W = {gw}; window.PM_SLACK = {sl}; window.PM_ROW_W = {rw}; window.PM_TW_W = {os.environ.get("TW_W", "0")}; window.PM_ROW_W2 = {os.environ.get("ROW_W2", "0")}; window.PM_SOFT_W = {os.environ.get("SOFT_W", "0")}; window.PM_ROW_SLACK = {os.environ.get("ROW_SLACK", "0.006")}; window.PM_ROW_WPTS = {os.environ.get("ROW_WPTS", "20")}; if ('{fl}') window.PM_F_LIST = [{fl}]; }}")
-    print(f"== 곡률 {cw} / 앵커 {gw} / 여유 {sl} / 글줄 {rw} / 비틀림페널티 {os.environ.get('TW_W', '0')} / 연경계 {os.environ.get('SOFT_W','0')} / 2단계글줄 {os.environ.get('ROW_W2', '0')} 여유{os.environ.get('ROW_SLACK','0.006')} 강도{os.environ.get('ROW_WPTS','20')} / F {fl or 0.75} ==")
+    pg.evaluate(f"() => {{ window.PM_CURV_W = {cw}; window.PM_GUIDE_W = {gw}; window.PM_SLACK = {sl}; window.PM_ROW_W = {rw}; window.PM_TW_W = {os.environ.get("TW_W", "0")}; window.PM_ROW_W2 = {os.environ.get("ROW_W2", "0")}; window.PM_SOFT_W = {os.environ.get("SOFT_W", "1.0")}; window.PM_TEXT_FIRST = {os.environ.get("TEXT_FIRST", "0")}; window.PM_ROW_SLACK = {os.environ.get("ROW_SLACK", "0.006")}; window.PM_ROW_WPTS = {os.environ.get("ROW_WPTS", "20")}; if ('{fl}') window.PM_F_LIST = [{fl}]; }}")
+    print(f"== 곡률 {cw} / 앵커 {gw} / 여유 {sl} / 글줄 {rw} / 비틀림페널티 {os.environ.get('TW_W', '0')} / 연경계 {os.environ.get('SOFT_W','1.0')} / 글자우선 {os.environ.get('TEXT_FIRST','0')} / 2단계글줄 {os.environ.get('ROW_W2', '0')} 여유{os.environ.get('ROW_SLACK','0.006')} 강도{os.environ.get('ROW_WPTS','20')} / F {fl or 0.75} ==")
     tot = {"cur": [], "fit": [], "orc": []}
     only = os.environ.get("ONLY", "")
     for name in GT.keys():

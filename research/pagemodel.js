@@ -227,12 +227,12 @@ function pmMarginScore(P, gray, W, H) {
 }
 
 /* 좌표 상승 최적화 (특허의 반복 추정 실시예 — 수치 미분 + 스텝 축소) */
-function pmFit(grad, W, H, guide, initP, stepScale = 1) {
+function pmFit(grad, W, H, guide, initP, stepScale = 1, onlyNames = null) {
   const P = { ...initP };
   if (P.z1b === undefined) P.z1b = P.z1;
   if (P.z2b === undefined) P.z2b = P.z2;
   if (P.tw === undefined) P.tw = 0;
-  const names = ['tx', 'ty', 'pw', 'ph', 'rx', 'ry', 'rz', 'z1', 'z2', 'z1b', 'z2b', 'tw'];
+  const names = onlyNames || ['tx', 'ty', 'pw', 'ph', 'rx', 'ry', 'rz', 'z1', 'z2', 'z1b', 'z2b', 'tw'];
   const step0 = {};
   for (const [k, v] of Object.entries({ tx: 0.04, ty: 0.04, pw: 0.05, ph: 0.05, rx: 0.05, ry: 0.05, rz: 0.02, z1: 0.03, z2: 0.03, z1b: 0.03, z2b: 0.03, tw: 0.03 })) {
     step0[k] = v * stepScale;
@@ -454,6 +454,28 @@ function pmTrimDarkBorders(gray, w, h) {
   if (x0) x0 = Math.min(maxX, x0 + 2); if (x1 < w) x1 = Math.max(w - maxX, x1 - 2);
   if (y0) y0 = Math.min(maxY, y0 + 2); if (y1 < h) y1 = Math.max(h - maxY, y1 - 2);
   return { x0, x1, y0, y1 };
+}
+
+/* 글자 우선(text-first) 파이프라인 — 사용자 원칙 "안내선이 아니라 글자가 기준":
+   A) 엣지 증거 없이(거리장=상수) 글줄 수평·여백 수직 항만으로 자세(회전·곡률·비틀림)를 구한다.
+      모서리 앵커는 넓은 여유(4%)로 대략의 위치만 잡아준다.
+   B) 그 자세를 고정한 채 위치·크기(tx,ty,pw,ph)만 엣지로 맞춘다 = 자르는 틀 */
+function pmFitTextFirst(field, W, H, anchorC, P0, rowW = 300) {
+  const flat = { dist: new Float32Array(W * H), gray: field.gray };  // 챔퍼 항 무력화
+  const gA = { anchorC, slack: 0.04 * Math.max(W, H), w: 5, rowW };
+  let best = null;
+  for (const s of [{}, { z1: -0.1, z2: -0.1 }, { z1: 0.1, z2: 0.1 }, { rx: 0.1 }, { rx: -0.1 }, { ry: 0.1 }, { ry: -0.1 }]) {
+    const r = pmFit(flat, W, H, gA, { ...P0, ...s });
+    if (!best || r.score > best.score) best = r;
+  }
+  for (const sc of [0.3, 0.1]) { const r = pmFit(flat, W, H, gA, best.P, sc); if (r.score > best.score) best = r; }
+  const gB = { anchorC, slack: 0.01 * Math.max(W, H), w: 20, rowW: 0 };
+  let cur = { P: best.P, score: pmScore(best.P, field, W, H, gB) };
+  for (const sc of [1, 0.4, 0.15]) {
+    const r = pmFit(field, W, H, gB, cur.P, sc, ['tx', 'ty', 'pw', 'ph']);
+    if (r.score > cur.score) cur = r;
+  }
+  return cur.P;
 }
 
 /* 펴진 페이지의 실제 가로/세로 비율: 중간 행 단면 호길이 × pw / ph
