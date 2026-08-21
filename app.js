@@ -5,11 +5,11 @@
 'use strict';
 
 const OPENCV_URL = 'https://docs.opencv.org/4.7.0/opencv.js';
-const CAPTURE_MAX_SIDE = 2500;   // 촬영 원본 보관 해상도(장변)
+const CAPTURE_MAX_SIDE = 4000;   // 촬영 원본 보관 해상도(장변) — 정지화상(takePhoto) 최대 해상도를 살리기 위해 상향
 const THUMB_MAX_SIDE = 420;      // 갤러리 썸네일
 const EDIT_MAX_SIDE = 1100;      // 편집 미리보기
 const PDF_QUALITY = {
-  high: { maxSide: 2400, jpeg: 0.92 },
+  high: { maxSide: 3200, jpeg: 0.92 },
   mid:  { maxSide: 2000, jpeg: 0.80 },
   low:  { maxSide: 1400, jpeg: 0.60 },
 };
@@ -1221,8 +1221,8 @@ function camConstraints() {
   if (state.camFlip) portrait = !portrait; // 사용자가 회전 버튼으로 방향을 뒤집은 경우
   return {
     facingMode: { ideal: 'environment' },
-    width: { ideal: portrait ? 1440 : 2560 },
-    height: { ideal: portrait ? 2560 : 1440 },
+    width: { ideal: portrait ? 3000 : 4000 },
+    height: { ideal: portrait ? 4000 : 3000 },
     aspectRatio: { ideal: portrait ? 3 / 4 : 4 / 3 },
   };
 }
@@ -1283,6 +1283,7 @@ async function startCamera(isRetry = false) {
 
     msg.classList.add('hidden');
     $('btn-shutter').disabled = false;
+    setupTorchButton();
   } catch (e) {
     console.warn('camera error', e);
     $('btn-shutter').disabled = true;
@@ -1290,6 +1291,52 @@ async function startCamera(isRetry = false) {
     msg.querySelector('p').innerHTML =
       '카메라를 사용할 수 없습니다.<br>권한을 허용했는지 확인하거나<br>아래 <b>불러오기</b>로 사진을 가져오세요.';
   }
+}
+
+/* 플래시(torch): 지원 기기(안드로이드 크롬)에서만 버튼 표시. 그림자·어두운 조명을 촬영 단계에서 줄인다 */
+function setupTorchButton() {
+  const btn = $('btn-torch');
+  const track = state.stream ? state.stream.getVideoTracks()[0] : null;
+  let caps = null;
+  try { caps = track && track.getCapabilities ? track.getCapabilities() : null; } catch (e) { caps = null; }
+  const ok = !!(caps && caps.torch);
+  btn.classList.toggle('hidden', !ok);
+  btn.classList.remove('on');
+  state.torchOn = false;
+}
+async function toggleTorch() {
+  const track = state.stream ? state.stream.getVideoTracks()[0] : null;
+  if (!track) return;
+  const next = !state.torchOn;
+  try {
+    await track.applyConstraints({ advanced: [{ torch: next }] });
+    state.torchOn = next;
+    $('btn-torch').classList.toggle('on', next);
+  } catch (e) {
+    toast('이 기기에서는 플래시를 켤 수 없습니다', { type: 'error' });
+  }
+}
+
+/* 수평계: 폰을 페이지와 평행하게(화면이 하늘을 향해 수평) 들도록 유도 — 원근 왜곡·초점 불균일 감소.
+   DeviceOrientation beta(앞뒤)·gamma(좌우) 기울기를 버블로 표시, 4° 이내면 초록 */
+let levelStarted = false;
+async function startLevelIndicator(fromGesture) {
+  if (levelStarted) return;
+  const D = window.DeviceOrientationEvent;
+  if (!D) return;
+  if (typeof D.requestPermission === 'function') { // iOS
+    if (!fromGesture) return;
+    try { if ((await D.requestPermission()) !== 'granted') return; } catch (e) { return; }
+  }
+  levelStarted = true;
+  const el = $('level-ind'); const dot = el.querySelector('i');
+  window.addEventListener('deviceorientation', (ev) => {
+    if (ev.beta === null || ev.gamma === null) return;
+    el.classList.remove('hidden'); // 센서 값이 실제로 올 때만 표시 (센서 없는 PC에선 숨김)
+    const bx = Math.max(-20, Math.min(20, ev.gamma)), by = Math.max(-20, Math.min(20, ev.beta));
+    dot.style.transform = 'translate(' + (bx * 0.9).toFixed(1) + 'px, ' + (by * 0.9).toFixed(1) + 'px)';
+    el.classList.toggle('ok', Math.abs(ev.gamma) < 4 && Math.abs(ev.beta) < 4);
+  });
 }
 
 function stopCamera() {
@@ -1337,7 +1384,37 @@ async function flipCameraOrientation() {
 }
 
 /* 실시간 문서 감지 오버레이 — 시간 평활(EMA)로 떨림 억제 + 안정 상태 표시 */
-const liveDetect = { quad: null, poly: null, pending: null, hitStreak: 0, missStreak: 0 };
+const liveDetect = { quad: null, poly: null, pending: null, hitStreak: 0, missStreak: 0,
+  prevSmall: null, motion: 99, sharp: 0, sharpMax: 0, stillStreak: 0, readyStreak: 0, lastAutoAt: 0, sceneChanged: true, lastPolyForStill: null };
+
+/* 프레임 품질 측정(유료 앱의 '흔들림·흐림 게이트'): 움직임 = 연속 프레임 평균 절대차(90px 축소),
+   선명도 = 라플라시안 분산(감지 캔버스 그레이). 선명도는 절대값이 내용에 따라 달라 최근 최대값 대비로도 본다 */
+function measureFrameQuality(work) {
+  const w = 90, h = Math.max(8, Math.round((90 * work.height) / work.width));
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const ctx = c.getContext('2d'); ctx.drawImage(work, 0, 0, w, h);
+  const d = ctx.getImageData(0, 0, w, h).data;
+  const g = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) g[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+  let motion = 99;
+  if (liveDetect.prevSmall && liveDetect.prevSmall.length === g.length) {
+    let sum = 0; for (let i = 0; i < g.length; i++) sum += Math.abs(g[i] - liveDetect.prevSmall[i]);
+    motion = sum / g.length;
+  }
+  liveDetect.prevSmall = g;
+  let sharp = 0;
+  if (state.cvReady) {
+    const src = cv.imread(work); const gray = new cv.Mat(); cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    const lap = new cv.Mat(); cv.Laplacian(gray, lap, cv.CV_64F);
+    const mean = new cv.Mat(), std = new cv.Mat(); cv.meanStdDev(lap, mean, std);
+    const sd = std.doubleAt(0, 0);
+    sharp = sd * sd;
+    src.delete(); gray.delete(); lap.delete(); mean.delete(); std.delete();
+  }
+  liveDetect.motion = motion; liveDetect.sharp = sharp;
+  liveDetect.sharpMax = Math.max(sharp, liveDetect.sharpMax * 0.97); // 서서히 잊는 최근 최대
+  if (motion > 12) liveDetect.sceneChanged = true; // 페이지를 넘기거나 크게 움직임 → 다음 자동 촬영 허용
+}
 
 /* 빨간 기준선 규칙(사용자 원칙: 책의 왼쪽 변은 항상 빨간 선에 맞춘다):
    - 왼쪽 경계는 기준선 왼쪽으로 절대 못 넘는다 (넘으면 책상·옆 책을 잡은 것)
@@ -1446,6 +1523,7 @@ function startLiveOverlay() {
         return;
       }
 
+      measureFrameQuality(work);
       const foundRes = findDocQuad(work, 0.15);
       const found = foundRes ? foundRes.quad : null;
       if (found) {
@@ -1522,14 +1600,37 @@ function startLiveOverlay() {
           octx.fill();
         }
       }
+      // 정지 판정: 윤곽이 프레임 간 0.8% 이내로 머무름 + 화면 움직임 작음
+      const frameMax = Math.max(work.width, work.height);
+      if (liveDetect.poly && liveDetect.lastPolyForStill && polyMaxDist(liveDetect.poly, liveDetect.lastPolyForStill) < 0.008 * frameMax && liveDetect.motion < 4) liveDetect.stillStreak++;
+      else liveDetect.stillStreak = 0;
+      liveDetect.lastPolyForStill = liveDetect.poly ? liveDetect.poly.map((p) => ({ x: p.x, y: p.y })) : null;
+      const blurry = liveDetect.sharp < Math.max(40, 0.55 * liveDetect.sharpMax);
+      const moving = liveDetect.motion >= 4;
+      const ready = stable && liveDetect.hitStreak >= 4 && liveDetect.stillStreak >= 2 && !blurry && !moving;
+      liveDetect.readyStreak = ready ? liveDetect.readyStreak + 1 : 0;
       if (hint) {
-        if (stable) {
+        if (stable && (moving || blurry)) {
+          hint.textContent = moving ? '흔들림 — 잠시 멈춰 주세요' : '초점이 흐림 — 거리를 조정해 주세요';
+          hint.className = 'detect-hint warn';
+        } else if (ready && state.autoCapture) {
+          hint.textContent = liveDetect.sceneChanged ? '자동 촬영 준비…' : '다음 페이지로 넘겨 주세요';
+          hint.className = 'detect-hint ok';
+        } else if (stable) {
           hint.textContent = '문서 인식됨 — 촬영하세요';
           hint.className = 'detect-hint ok';
         } else {
           hint.textContent = '문서를 화면에 맞춰 주세요';
           hint.className = 'detect-hint';
         }
+      }
+      // 자동 촬영: 준비 상태가 약 1초(3프레임) 유지 + 쿨다운 + 장면 변화(페이지 넘김) 이후에만
+      if (state.autoCapture && ready && liveDetect.readyStreak >= 3 && liveDetect.sceneChanged
+          && !state.capturing && Date.now() - liveDetect.lastAutoAt > 2500) {
+        liveDetect.lastAutoAt = Date.now();
+        liveDetect.sceneChanged = false;
+        liveDetect.readyStreak = 0;
+        capture();
       }
     } catch (e) { /* 프레임 스킵 */ }
   }, 350);
@@ -1551,13 +1652,83 @@ async function capture() {
   void flash.offsetWidth;
   flash.classList.add('flash');
 
+  if (state.capturing) return;
+  state.capturing = true;
+  try {
+    const track = state.stream?.getVideoTracks()[0];
+    const { canvas: c, source } = await grabBestStill(video, track);
+    state.lastCapture = { source, w: c.width, h: c.height };
+    const blob = await new Promise((res) => c.toBlob(res, 'image/jpeg', 0.92));
+    await addCapturedBlob(blob, false, true);
+  } finally {
+    state.capturing = false;
+  }
+}
+
+/* 정지화상 우선 촬영(유료 앱 방식): ImageCapture.takePhoto()는 영상 프레임보다 훨씬 높은
+   사진 해상도를 준다(안드로이드 크롬). 단 기기에 따라 방향·화각이 프레임과 다를 수 있으므로
+   프레임과 대조(방향 맞춤 + 정규화 상관 ≥ 0.85)해 통과할 때만 채택, 아니면 프레임 사용 */
+function drawVideoFrame(video) {
   const c = document.createElement('canvas');
   const scale = Math.min(1, CAPTURE_MAX_SIDE / Math.max(video.videoWidth, video.videoHeight));
   c.width = Math.round(video.videoWidth * scale);
   c.height = Math.round(video.videoHeight * scale);
   c.getContext('2d').drawImage(video, 0, 0, c.width, c.height);
-  const blob = await new Promise((res) => c.toBlob(res, 'image/jpeg', 0.92));
-  await addCapturedBlob(blob, false, true);
+  return c;
+}
+function thumbGray(src, w, h) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  c.getContext('2d').drawImage(src, 0, 0, w, h);
+  const d = c.getContext('2d').getImageData(0, 0, w, h).data;
+  const g = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) g[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+  return g;
+}
+function ncc(a, b) {
+  let ma = 0, mb = 0; const n = a.length;
+  for (let i = 0; i < n; i++) { ma += a[i]; mb += b[i]; }
+  ma /= n; mb /= n;
+  let sab = 0, saa = 0, sbb = 0;
+  for (let i = 0; i < n; i++) { const x = a[i] - ma, y = b[i] - mb; sab += x * y; saa += x * x; sbb += y * y; }
+  return sab / (Math.sqrt(saa * sbb) || 1);
+}
+function rotateBitmap(bmp, deg) {
+  const swap = deg % 180 !== 0;
+  const c = document.createElement('canvas');
+  c.width = swap ? bmp.height : bmp.width; c.height = swap ? bmp.width : bmp.height;
+  const ctx = c.getContext('2d');
+  ctx.translate(c.width / 2, c.height / 2); ctx.rotate((deg * Math.PI) / 180);
+  ctx.drawImage(bmp, -bmp.width / 2, -bmp.height / 2);
+  return c;
+}
+async function grabBestStill(video, track) {
+  const frame = drawVideoFrame(video);
+  if (!window.ImageCapture || !track) return { canvas: frame, source: 'frame' };
+  try {
+    const ic = new ImageCapture(track);
+    const blob = await Promise.race([ic.takePhoto(), new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 3000))]);
+    const bmp = await createImageBitmap(blob);
+    const frameLandscape = frame.width > frame.height;
+    const cands = (bmp.width > bmp.height) === frameLandscape ? [rotateBitmap(bmp, 0)] : [rotateBitmap(bmp, 90), rotateBitmap(bmp, -90)];
+    bmp.close();
+    const tw = 48, th = Math.max(8, Math.round((48 * frame.height) / frame.width));
+    const ref = thumbGray(frame, tw, th);
+    let best = null, bestR = -1;
+    for (const cand of cands) { const r = ncc(ref, thumbGray(cand, tw, th)); if (r > bestR) { bestR = r; best = cand; } }
+    const gain = Math.max(best.width, best.height) / Math.max(frame.width, frame.height);
+    if (bestR < 0.85 || gain < 1.05) return { canvas: frame, source: `frame(photo r=${bestR.toFixed(2)} g=${gain.toFixed(2)})` };
+    // 보관 해상도로 축소
+    const scale = Math.min(1, CAPTURE_MAX_SIDE / Math.max(best.width, best.height));
+    if (scale < 1) {
+      const c = document.createElement('canvas');
+      c.width = Math.round(best.width * scale); c.height = Math.round(best.height * scale);
+      c.getContext('2d').drawImage(best, 0, 0, c.width, c.height);
+      return { canvas: c, source: 'photo' };
+    }
+    return { canvas: best, source: 'photo' };
+  } catch (e) {
+    return { canvas: frame, source: 'frame(' + (e && e.message ? e.message : 'err') + ')' };
+  }
 }
 
 /* 촬영/불러오기 공통 진입점 — 펼침면 모드면 좌/우 분할 시도
@@ -2478,7 +2649,20 @@ function bindEvents() {
   $('btn-back').onclick = () => show(state.screen === 'edit' ? 'gallery' : 'capture');
 
   // 촬영
-  $('btn-shutter').onclick = capture;
+  $('btn-shutter').onclick = () => { startLevelIndicator(true); capture(); };
+  // 자동 촬영 토글(기억) / 플래시 / 수평계
+  state.autoCapture = localStorage.getItem('ds_auto') === '1';
+  $('btn-auto').classList.toggle('on', state.autoCapture);
+  $('btn-auto').onclick = () => {
+    state.autoCapture = !state.autoCapture;
+    try { localStorage.setItem('ds_auto', state.autoCapture ? '1' : '0'); } catch (e) { /* 저장 불가 */ }
+    $('btn-auto').classList.toggle('on', state.autoCapture);
+    liveDetect.sceneChanged = true; liveDetect.readyStreak = 0;
+    startLevelIndicator(true);
+    toast(state.autoCapture ? '자동 촬영 켜짐 — 문서가 안정되면 찍습니다' : '자동 촬영 꺼짐', { duration: 1600 });
+  };
+  $('btn-torch').onclick = toggleTorch;
+  startLevelIndicator(false); // 안드로이드는 권한 없이 시작
   $('btn-cam-rotate').onclick = flipCameraOrientation;
   $('btn-spread').classList.toggle('on', state.spreadMode);
   $('btn-spread').onclick = () => {
@@ -2609,7 +2793,8 @@ function bindEvents() {
     if (now - logoTap < 350) {
       const st = state.stream?.getVideoTracks()[0]?.getSettings() || {};
       const v = $('cam');
-      toast(`카메라 ${st.width || '?'}×${st.height || '?'} / 표시 ${v.videoWidth}×${v.videoHeight} / 화면 ${window.innerWidth}×${window.innerHeight}`, { duration: 5000 });
+      const lc = state.lastCapture ? ` / 최근촬영 ${state.lastCapture.source} ${state.lastCapture.w}×${state.lastCapture.h}` : '';
+      toast(`카메라 ${st.width || '?'}×${st.height || '?'} / 표시 ${v.videoWidth}×${v.videoHeight} / 화면 ${window.innerWidth}×${window.innerHeight}${lc}`, { duration: 7000 });
     }
     logoTap = now;
   });
