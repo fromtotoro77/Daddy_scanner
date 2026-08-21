@@ -917,7 +917,15 @@ function warpModel(src, model, opts) {
   cv.remap(srcM, dst, mX, mY, cv.INTER_LINEAR, cv.BORDER_REPLICATE);
   mX.delete(); mY.delete(); srcM.delete();
   if (opts.textRect) {
-    const g = new cv.Mat(); cv.cvtColor(dst, g, cv.COLOR_RGBA2GRAY);
+    // 1) 전역 기울기: 괘선·글줄의 공통 기울기로 내용 전체 회전 (도형 보존)
+    let g = new cv.Mat(); cv.cvtColor(dst, g, cv.COLOR_RGBA2GRAY);
+    const ang = pmDeskewAngle(g, outW, outH);
+    if (Math.abs(ang) > 0.05 && Math.abs(ang) < 12) {
+      const r = pmRotateMat(dst, ang);
+      dst.delete(); dst = r;
+      g.delete(); g = new cv.Mat(); cv.cvtColor(dst, g, cv.COLOR_RGBA2GRAY);
+    }
+    // 2) 남은 휨만 직교화
     const rt = pmTextRectifyMaps(g, outW, outH, !!opts.marginFix);
     g.delete();
     if (rt) {

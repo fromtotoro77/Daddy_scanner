@@ -5,7 +5,7 @@
 'use strict';
 
 /* 실험으로 확정한 기본 가중치 (window.PM_* 로 오버라이드 가능 — 채점 하네스용) */
-const PM_DEFAULTS = { PM_CURV_W: 150, PM_TW_W: 900, PM_ROW_W: 30, PM_SOFT_W: 1.0 };
+const PM_DEFAULTS = { PM_CURV_W: 150, PM_TW_W: 900, PM_ROW_W: 30, PM_SOFT_W: 1.0, PM_RECT_DEG: 2 };
 function pmFlag(name) {
   if (typeof window !== 'undefined' && window[name] !== undefined) return window[name];
   return PM_DEFAULTS[name];
@@ -537,7 +537,8 @@ function pmExtractTextLines(grayMat, W, H) {
   for (let i = 1; i < n; i++) {
     const x = stats.intAt(i, cv.CC_STAT_LEFT), y = stats.intAt(i, cv.CC_STAT_TOP);
     const w = stats.intAt(i, cv.CC_STAT_WIDTH), h = stats.intAt(i, cv.CC_STAT_HEIGHT);
-    if (w < W * 0.12 || h < H * 0.004 || h > H * 0.035 || w / h < 5) continue;
+    const isRule = w >= W * 0.4 && h >= 2 && h < H * 0.004; // 인쇄 괘선: 가장 완벽한 수평 기준
+    if (!isRule && (w < W * 0.12 || h < H * 0.004 || h > H * 0.035 || w / h < 5)) continue;
     // 열 샘플마다 전경 픽셀의 평균 y = 중심선
     const pts = [];
     const step = Math.max(3, Math.round(w / 24));
@@ -633,24 +634,22 @@ function pmRefineByTextLines(field, W, H, P1, text, opts) {
 function pmTextRectifyMaps(grayMat, w, h, useMargin) {
   const text = pmExtractTextLines(grayMat, w, h);
   if (text.lines.length < 4) return null;
-  // 줄별: 평균 y, x→편차 테이블 (이동평균 5로 평활)
-  // 줄 중심선은 글자 키(대문자·따옴표·밑줄)에 따라 열마다 튄다 — 종이의 휨은 매끄러우므로
-  // 2차 곡선으로 강건 피팅(이상치 1회 제거)해 글자 모양 성분을 걸러내고 휨 성분만 남긴다
+  // 각 줄의 점 → (x, y, 잔차 = y − 줄 평균). 줄 평균은 2차 강건 피팅값의 평균(글자 키 튐 제거)
+  const samples = [];
   const fitQuad = (pts) => {
-    let use = pts;
-    let coef = null;
+    let use = pts, coef = null;
     for (let round = 0; round < 2; round++) {
       const n = use.length;
       const mx = use.reduce((a, p) => a + p.x, 0) / n;
-      let s0 = n, s1 = 0, s2 = 0, s3 = 0, s4 = 0, t0 = 0, t1 = 0, t2 = 0;
+      let s1 = 0, s2 = 0, s3 = 0, s4 = 0, t0 = 0, t1 = 0, t2 = 0;
       for (const p of use) {
         const x = (p.x - mx) / 1000, x2 = x * x;
         s1 += x; s2 += x2; s3 += x2 * x; s4 += x2 * x2;
         t0 += p.y; t1 += x * p.y; t2 += x2 * p.y;
       }
-      // 3×3 정규방정식 크래머 풀이
+      const s0 = n;
       const det = s0 * (s2 * s4 - s3 * s3) - s1 * (s1 * s4 - s3 * s2) + s2 * (s1 * s3 - s2 * s2);
-      if (Math.abs(det) < 1e-12) { const m = t0 / n; coef = { mx, a: m, b: 0, c: 0 }; break; }
+      if (Math.abs(det) < 1e-12) { coef = { mx, a: t0 / n, b: 0, c: 0 }; break; }
       const a = (t0 * (s2 * s4 - s3 * s3) - s1 * (t1 * s4 - s3 * t2) + s2 * (t1 * s3 - s2 * t2)) / det;
       const b = (s0 * (t1 * s4 - s3 * t2) - t0 * (s1 * s4 - s3 * s2) + s2 * (s1 * t2 - t1 * s2)) / det;
       const c = (s0 * (s2 * t2 - t1 * s3) - s1 * (s1 * t2 - t1 * s2) + t0 * (s1 * s3 - s2 * s2)) / det;
@@ -666,41 +665,85 @@ function pmTextRectifyMaps(grayMat, w, h, useMargin) {
   const L = [];
   for (const pts of text.lines) {
     const f = fitQuad(pts);
-    const xs = pts.map((p) => p.x);
-    const fitted = xs.map(f);
+    const fitted = pts.map((p) => f(p.x));
     const m = fitted.reduce((a, b) => a + b, 0) / fitted.length;
-    L.push({ m, xs, dev: fitted.map((y) => y - m) });
+    // 긴 줄일수록 곡면을 더 강하게 구속 (짧은 줄은 가중 ↓)
+    const wgt = Math.min(1, pts.length / 16);
+    pts.forEach((p, i) => samples.push({ x: p.x / w, y: p.y / h, r: fitted[i] - m, wgt }));
+    L.push({ m, f, x0: pts[0].x, x1: pts[pts.length - 1].x });
   }
   L.sort((a, b) => a.m - b.m);
-  const devAt = (ln, x) => { // 줄 안 가로 선형 보간, 밖은 끝값 유지
-    const xs = ln.xs, d = ln.dev;
-    if (x <= xs[0]) return d[0];
-    if (x >= xs[xs.length - 1]) return d[d.length - 1];
-    let i = 1; while (xs[i] < x) i++;
-    const t = (x - xs[i - 1]) / (xs[i] - xs[i - 1]);
-    return d[i - 1] + t * (d[i] - d[i - 1]);
+  if (samples.length < 24) return null;
+  // 저차 2D 다항 곡면 d(x,y) = Σ a_ij x^i y^j (i,j ≤ 2) 가중 최소제곱 — 9×9 정규방정식
+  // x는 3차(비대칭 말림), y는 2차 — 12항 (PM_RECT_DEG=2면 9항)
+  const degX = pmFlag('PM_RECT_DEG') === 2 ? 2 : 3;
+  const basis = (x, y) => {
+    const px = degX === 3 ? [1, x, x * x, x * x * x] : [1, x, x * x];
+    const py = [1, y, y * y];
+    const out = [];
+    for (const a of py) for (const b of px) out.push(a * b);
+    return out;
   };
-  // 세로 변위 dy(x,y): 줄 사이 선형 보간, 첫 줄 위/마지막 줄 아래는 끝 줄 값
+  const N = basis(0, 0).length;
+  const A = Array.from({ length: N }, () => new Float64Array(N));
+  const bvec = new Float64Array(N);
+  for (const s of samples) {
+    const phi = basis(s.x, s.y);
+    for (let i = 0; i < N; i++) {
+      bvec[i] += s.wgt * phi[i] * s.r;
+      for (let j = 0; j < N; j++) A[i][j] += s.wgt * phi[i] * phi[j];
+    }
+  }
+  for (let i = 0; i < N; i++) A[i][i] += 1e-6; // 리지(짧은 줄만 있는 영역 안정화)
+  // 가우스 소거
+  const M = A.map((row, i) => [...row, bvec[i]]);
+  for (let c = 0; c < N; c++) {
+    let piv = c;
+    for (let r = c + 1; r < N; r++) if (Math.abs(M[r][c]) > Math.abs(M[piv][c])) piv = r;
+    [M[c], M[piv]] = [M[piv], M[c]];
+    if (Math.abs(M[c][c]) < 1e-12) return null;
+    for (let r = 0; r < N; r++) {
+      if (r === c) continue;
+      const f = M[r][c] / M[c][c];
+      for (let k = c; k <= N; k++) M[r][k] -= f * M[c][k];
+    }
+  }
+  const coefs = M.map((row, i) => row[N] / row[i]);
+  // 다항 곡면은 증거(글줄) 범위 밖에서 외삽으로 벌어진다 → 평가 좌표를 증거 범위로 클램프
+  // (여백 영역은 가장 가까운 글줄 끝의 보정값을 그대로 이어받음 — 우측 끝 처짐 방지)
+  let sx0 = 1, sx1 = 0, sy0 = 1, sy1 = 0;
+  for (const s of samples) { if (s.x < sx0) sx0 = s.x; if (s.x > sx1) sx1 = s.x; if (s.y < sy0) sy0 = s.y; if (s.y > sy1) sy1 = s.y; }
+  const dAt = (x, y) => {
+    const cx = Math.min(sx1, Math.max(sx0, x)), cy = Math.min(sy1, Math.max(sy0, y));
+    const phi = basis(cx, cy); let s = 0; for (let i = 0; i < N; i++) s += coefs[i] * phi[i]; return s;
+  };
+  // 좌측 정렬선 수평 변위 dx(y): 시작점들을 1차(기울기)+2차로 강건 피팅
+  let dxAt = () => 0, nStarts = 0;
+  if (useMargin && text.starts.length >= 4) {
+    const st = text.starts.slice().sort((a, b) => a.y - b.y);
+    const f = fitQuad(st.map((s) => ({ x: s.y, y: s.x }))); // y→x 곡선
+    const mx = st.reduce((a, s) => a + f(s.y), 0) / st.length;
+    dxAt = (y) => f(y) - mx;
+    nStarts = st.length;
+  }
+  // 혼합 변위: 줄의 실측 범위 안은 그 줄의 2차 피팅값(정확), 밖은 전역 곡면(매끄러움),
+  // 경계 ±3% 폭은 선형 블렌드(꺾임 방지). 줄 사이는 세로 선형 보간, 첫/끝 줄 밖은 끝 줄 값
+  const taper = Math.max(8, w * 0.03);
+  const lineDev = (ln, x) => {
+    const sv = dAt(x / w, ln.m / h);
+    if (x < ln.x0 - taper || x > ln.x1 + taper) return sv;
+    const qv = ln.f(x) - ln.m;
+    if (x >= ln.x0 && x <= ln.x1) return qv;
+    const t = x < ln.x0 ? (ln.x0 - x) / taper : (x - ln.x1) / taper; // 0(실측 끝)→1(곡면)
+    return qv * (1 - t) + sv * t;
+  };
   const mapX = new Float32Array(w * h), mapY = new Float32Array(w * h);
   let maxShift = 0;
-  // 좌측 정렬선 수평 변위 dx(y)
-  let starts = null;
-  if (useMargin && text.starts.length >= 4) {
-    starts = text.starts.slice().sort((a, b) => a.y - b.y);
-    const mx = starts.reduce((a, s) => a + s.x, 0) / starts.length;
-    starts = starts.map((s) => ({ y: s.y, d: s.x - mx }));
-  }
-  const dxAt = (y) => {
-    if (!starts) return 0;
-    if (y <= starts[0].y) return starts[0].d;
-    if (y >= starts[starts.length - 1].y) return starts[starts.length - 1].d;
-    let i = 1; while (starts[i].y < y) i++;
-    const t = (y - starts[i - 1].y) / (starts[i].y - starts[i - 1].y);
-    return starts[i - 1].d + t * (starts[i].d - starts[i - 1].d);
-  };
+  const rowDx = new Float32Array(h);
+  for (let y = 0; y < h; y++) rowDx[y] = dxAt(y);
   const colDev = new Float32Array(L.length);
   for (let x = 0; x < w; x++) {
-    for (let i = 0; i < L.length; i++) colDev[i] = devAt(L[i], x);
+    for (let i = 0; i < L.length; i++) colDev[i] = lineDev(L[i], x);
     let li = 0;
     for (let y = 0; y < h; y++) {
       let d;
@@ -711,13 +754,44 @@ function pmTextRectifyMaps(grayMat, w, h, useMargin) {
         const t = (y - L[li].m) / (L[li + 1].m - L[li].m);
         d = colDev[li] + t * (colDev[li + 1] - colDev[li]);
       }
-      const dx = dxAt(y);
-      mapY[y * w + x] = y + d;   // 출력 y에 있어야 할 글줄은 입력에서 y+d에 있었다
-      mapX[y * w + x] = x + dx;
+      mapY[y * w + x] = y + d;
+      mapX[y * w + x] = x + rowDx[y];
       const a = Math.abs(d); if (a > maxShift) maxShift = a;
     }
   }
-  return { mapX, mapY, nLines: L.length, maxShift, nStarts: starts ? starts.length : 0 };
+  return { mapX, mapY, nLines: text.lines.length, maxShift, nStarts };
+}
+
+/* 전역 기울기(사용자 설계: 괘선·상자 밑변·글줄의 공통 기울기를 수평 기준으로 내용 전체를 회전).
+   각 줄/괘선을 1차 직선으로 피팅해 기울기를 구하고, 길이 가중 중앙값을 채택. 반환 단위: 도(시계방향 +) */
+function pmDeskewAngle(grayMat, w, h) {
+  const text = pmExtractTextLines(grayMat, w, h);
+  if (text.lines.length < 3) return 0;
+  const items = [];
+  for (const pts of text.lines) {
+    const n = pts.length;
+    const mx = pts.reduce((a, p) => a + p.x, 0) / n, my = pts.reduce((a, p) => a + p.y, 0) / n;
+    let sxy = 0, sxx = 0;
+    for (const p of pts) { sxy += (p.x - mx) * (p.y - my); sxx += (p.x - mx) * (p.x - mx); }
+    if (sxx < 1e-6) continue;
+    const span = pts[n - 1].x - pts[0].x;
+    items.push({ ang: Math.atan(sxy / sxx) * 180 / Math.PI, wgt: span }); // 긴 줄·괘선일수록 신뢰
+  }
+  if (!items.length) return 0;
+  items.sort((a, b) => a.ang - b.ang);
+  const total = items.reduce((a, it) => a + it.wgt, 0);
+  let acc = 0;
+  for (const it of items) { acc += it.wgt; if (acc >= total / 2) return it.ang; }
+  return items[items.length - 1].ang;
+}
+
+/* 회전 적용(도형 보존): 중심 기준, 크기 유지, 가장자리는 복제. 반환 새 Mat(호출자 delete) */
+function pmRotateMat(mat, angleDeg) {
+  const M = cv.getRotationMatrix2D(new cv.Point(mat.cols / 2, mat.rows / 2), angleDeg, 1);
+  const out = new cv.Mat();
+  cv.warpAffine(mat, out, M, new cv.Size(mat.cols, mat.rows), cv.INTER_LINEAR, cv.BORDER_REPLICATE);
+  M.delete();
+  return out;
 }
 
 /* 펴진 페이지의 실제 가로/세로 비율: 중간 행 단면 호길이 × pw / ph
