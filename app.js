@@ -1736,7 +1736,7 @@ async function capture() {
   void flash.offsetWidth;
   flash.classList.add('flash');
 
-  if (state.capturing) return;
+  if (state.capturing) { state.pendingCapture = true; return; } // 연속 셔터: 버리지 않고 현재 촬영 뒤 한 번 더
   state.capturing = true;
   try {
     const track = state.stream?.getVideoTracks()[0];
@@ -1746,6 +1746,7 @@ async function capture() {
     await addCapturedBlob(blob, false, true);
   } finally {
     state.capturing = false;
+    if (state.pendingCapture) { state.pendingCapture = false; setTimeout(capture, 50); }
   }
 }
 
