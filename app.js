@@ -549,7 +549,7 @@ function extractCurves(contour, quad) {
 /* 곡선 묶음({top,bottom,left,right,…})의 모든 점에 좌표 변환 적용 */
 function mapCurvePoints(curves, fn) {
   const o = {};
-  for (const k in curves) o[k] = curves[k].map(fn);
+  for (const k in curves) o[k] = curves[k] ? curves[k].map(fn) : null; // 직선 고정된 변(null)은 그대로
   return o;
 }
 
@@ -752,7 +752,7 @@ async function detectCorners(page) {
     c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
     bmp.close();
 
-    const found = findDocQuad(c, 0.15);
+    const found = findDocQuad(c, 0.15, !page.spreadSide); // 반쪽은 책등 쪽이 경계에 닿으므로 경계 페널티 없음
     let corners = found ? found.quad : null;
     let curves = found ? (found.curves || extractCurves(found.contour, found.quad)) : null;
 
@@ -774,9 +774,16 @@ async function detectCorners(page) {
       img.delete();
     }
 
-    // 가이드 기준 보정: 카메라 촬영본에서 자동 감지가 없거나 가이드와 동떨어지면
-    // 가이드 프레임 주변에서 경계를 스냅 (사용자가 가이드에 맞춰 찍었다는 전제)
-    if (page.fromCamera && state.cvReady) {
+    // 펼침면 반쪽: 책등 쪽 변 = 캔버스 경계(중앙 고정선)로 고정, 바깥 변·상하는 감지값(없으면 6% 인셋)
+    if (page.spreadSide) {
+      const W = c.width, H = c.height;
+      const gy0 = H * GUIDE_INSET, gy1 = H * (1 - GUIDE_INSET);
+      if (!corners) corners = { tl: { x: 0, y: gy0 }, tr: { x: W, y: gy0 }, br: { x: W, y: gy1 }, bl: { x: 0, y: gy1 } };
+      corners = { tl: { ...corners.tl }, tr: { ...corners.tr }, br: { ...corners.br }, bl: { ...corners.bl } };
+      if (page.spreadSide === 'left') { corners.tr.x = W; corners.br.x = W; }
+      else { corners.tl.x = 0; corners.bl.x = 0; }
+      if (curves) { if (page.spreadSide === 'left') curves.right = null; else curves.left = null; }
+    } else if (page.fromCamera && state.cvReady) {
       const iou = corners ? bboxIouWithGuide(corners, c.width, c.height) : 0;
       if (iou < 0.45) {
         const g = guideAnchoredQuad(c);
@@ -784,7 +791,7 @@ async function detectCorners(page) {
       }
     }
 
-    if (corners && page.fromCamera) {
+    if (corners && page.fromCamera && !page.spreadSide) {
       corners = enforceLeftGuide(corners, c.width, c.height); // 빨간 기준선 = 왼쪽 경계 정답
       if (curves && curves.left) curves.left = null;
     }
@@ -1868,100 +1875,31 @@ function findPageBlobs(canvas) {
 async function addSpreadPages(blob, silent) {
   try {
     const bmp = await createImageBitmap(blob);
-    const scale = Math.min(1, 1000 / Math.max(bmp.width, bmp.height));
-    const dc = document.createElement('canvas');
-    dc.width = Math.round(bmp.width * scale);
-    dc.height = Math.round(bmp.height * scale);
-    dc.getContext('2d').drawImage(bmp, 0, 0, dc.width, dc.height);
-    bmp.close();
-
-    const blobs = findPageBlobs(dc);
-    const up = (p) => ({ x: p.x / scale, y: p.y / scale });
-
-    // 두 블롭이 "좌우로 나란"할 때만 펼침면 두 페이지로 인정.
-    // (스프링 제본·그림자 같은 어두운 가로 띠가 한 페이지를 위/아래로 가른 경우 오인 방지)
-    if (blobs.length === 2) {
-      const cen = (q) => ({ x: (q.tl.x + q.tr.x + q.br.x + q.bl.x) / 4, y: (q.tl.y + q.tr.y + q.br.y + q.bl.y) / 4 });
-      const c1 = cen(blobs[0].quad), c2 = cen(blobs[1].quad);
-      if (Math.abs(c1.x - c2.x) < Math.abs(c1.y - c2.y) * 1.2) blobs.length = 1;
+    // 세로형 프레임이면 펼침면이 아니라 한 페이지(화면 미회전) — 자르지 않음
+    if (bmp.height > bmp.width * 1.15) {
+      bmp.close();
+      if (!silent) toast('가로 프레임이 아니라 분할하지 않았어요 — 펼침면은 폰을 가로로 돌려 촬영해 주세요', { type: 'error', duration: 3500 });
+      return false;
     }
-
-    if (blobs.length === 2) {
-      // 이상적 경로: 페이지별로 각각 보정 → 곡면도 페이지 단위로 정확히 펴짐
-      for (const b of blobs) {
-        const curves = b.curves || extractCurves(b.contour, b.quad);
-        const temp = {
-          blob,
-          corners: { tl: up(b.quad.tl), tr: up(b.quad.tr), br: up(b.quad.br), bl: up(b.quad.bl) },
-          curves: curves ? mapCurvePoints(curves, up) : null,
-          autoChecked: true, rotation: 0, filter: 'original', bright: 0, contrast: 0,
-        };
-        const canvas = await processPage(temp, CAPTURE_MAX_SIDE);
-        const pageBlob = await new Promise((res) => canvas.toBlob(res, 'image/jpeg', 0.92));
-        await addPage(pageBlob, true, true);
-      }
-      if (!silent) toast(`펼침면 분할 → ${state.pages.length - 1}·${state.pages.length}페이지`, { type: 'success', duration: 1600 });
-      return true;
-    }
-
-    // 폴백: 펼침면이 한 덩어리로 잡히면 통째 보정 후 책등 골짜기에서 절단
-    const temp = {
-      blob, corners: null, curves: null, autoChecked: false,
-      rotation: 0, filter: 'original', bright: 0, contrast: 0,
-    };
-    await detectCorners(temp);
-    if (!temp.corners) {
-      // 최후 폴백: 감지 실패 시에도 고정 중앙선 기준으로 절단
-      // (사용자가 책등을 빨간 선에 맞췄다는 전제 — 각 반쪽은 일반 감지·보정을 따로 거침)
-      const bmp2 = await createImageBitmap(blob);
-      const half = (x0, w) => {
-        const c = document.createElement('canvas');
-        c.width = w;
-        c.height = bmp2.height;
-        c.getContext('2d').drawImage(bmp2, x0, 0, w, bmp2.height, 0, 0, w, bmp2.height);
-        return new Promise((res) => c.toBlob(res, 'image/jpeg', 0.92));
-      };
-      const mid = Math.round(bmp2.width / 2);
-      const lb = await half(0, mid);
-      const rb = await half(mid, bmp2.width - mid);
-      bmp2.close();
-      await addPage(lb, true);
-      await addPage(rb, true);
-      if (!silent) toast('가운데 선 기준으로 2페이지 분할됨', { duration: 1800 });
-      return true;
-    }
-    const canvas = await processPage(temp, CAPTURE_MAX_SIDE);
-    if (canvas.width < 200) return false;
-    // 보정 결과가 세로형이면 펼침면이 아니라 한 페이지 → 자르지 않고 그대로 저장
-    if (canvas.width < canvas.height * 1.15) {
-      const single = await new Promise((res) => canvas.toBlob(res, 'image/jpeg', 0.92));
-      await addPage(single, true, true);
-      if (!silent) {
-        // 세로형인데 가로 골짜기가 있으면 = 화면이 안 돌아간 채 가로로 찍은 펼침면
-        if (hasHorizontalValley(canvas)) {
-          toast('화면이 회전되지 않아 좌/우 분할을 못 했어요 — 폰의 화면 자동회전을 켜고 다시 촬영해 주세요', { type: 'error', duration: 4000 });
-        } else {
-          toast('펼침면으로 보이지 않아 한 페이지로 저장됨', { duration: 1800 });
-        }
-      }
-      return true;
-    }
-    const sx = findSpineX(canvas);
-    const cut = (x0, w) => {
+    // 책등 = 화면 중앙 빨간 선(사용자가 맞춤) → 원본 해상도에서 정확히 반으로 분할.
+    // 각 반쪽은 일반 페이지와 같은 경로(자동 감지 → 페이지 모델 피팅 → 평탄화·직교화)를 타되,
+    // 책등 쪽 변은 캔버스 경계에 고정된다(spreadSide)
+    const half = (x0, w) => {
       const c = document.createElement('canvas');
-      c.width = w;
-      c.height = canvas.height;
-      c.getContext('2d').drawImage(canvas, x0, 0, w, canvas.height, 0, 0, w, canvas.height);
+      c.width = w; c.height = bmp.height;
+      c.getContext('2d').drawImage(bmp, x0, 0, w, bmp.height, 0, 0, w, bmp.height);
       return new Promise((res) => c.toBlob(res, 'image/jpeg', 0.92));
     };
-    const leftBlob = await cut(0, sx);
-    const rightBlob = await cut(sx, canvas.width - sx);
-    await addPage(leftBlob, true, true);
-    await addPage(rightBlob, true, true);
+    const mid = Math.round(bmp.width / 2);
+    const lb = await half(0, mid);
+    const rb = await half(mid, bmp.width - mid);
+    bmp.close();
+    await addPage(lb, true, false, true, 'left');
+    await addPage(rb, true, false, true, 'right');
     if (!silent) toast(`펼침면 분할 → ${state.pages.length - 1}·${state.pages.length}페이지`, { type: 'success', duration: 1600 });
     return true;
   } catch (e) {
-    console.warn('펼침면 분할 실패', e);
+    console.warn('addSpreadPages 실패', e);
     return false;
   }
 }
@@ -2047,8 +1985,9 @@ function findSpineX(canvas) {
 }
 
 /* 페이지 추가 (촬영/불러오기 공용). preprocessed=true면 이미 보정된 이미지라 감지 생략 */
-async function addPage(blob, silent = false, preprocessed = false, fromCamera = false) {
+async function addPage(blob, silent = false, preprocessed = false, fromCamera = false, spreadSide = null) {
   const page = {
+    spreadSide, // 'left' | 'right' — 펼침면 반쪽: 책등 쪽 변은 캔버스 경계에 고정
     id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random(),
     blob,
     corners: null,

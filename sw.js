@@ -1,14 +1,14 @@
 /* Daddy Scanner Service Worker v1.0.0
    - 앱 셸: 설치 시 프리캐시
    - CDN(OpenCV.js 8MB 포함)·폰트: 첫 사용 후 캐시 우선 → 두 번째 접속부터 즉시 실행/오프라인 동작 */
-const CACHE = 'daddy-scanner-v1.5.5';
+const CACHE = 'daddy-scanner-v1.5.6';
 const SHELL = [
   './',
   './index.html',
-  './app.css?v=1.5.5',
-  './app.js?v=1.5.5',
-  './pagemodel.js?v=1.5.5',
-  './manifest.json?v=1.5.5',
+  './app.css?v=1.5.6',
+  './app.js?v=1.5.6',
+  './pagemodel.js?v=1.5.6',
+  './manifest.json?v=1.5.6',
   './icons/icon-192.png',
   './icons/icon-512.png',
 ];
