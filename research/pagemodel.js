@@ -634,16 +634,42 @@ function pmTextRectifyMaps(grayMat, w, h, useMargin) {
   const text = pmExtractTextLines(grayMat, w, h);
   if (text.lines.length < 4) return null;
   // 줄별: 평균 y, x→편차 테이블 (이동평균 5로 평활)
+  // 줄 중심선은 글자 키(대문자·따옴표·밑줄)에 따라 열마다 튄다 — 종이의 휨은 매끄러우므로
+  // 2차 곡선으로 강건 피팅(이상치 1회 제거)해 글자 모양 성분을 걸러내고 휨 성분만 남긴다
+  const fitQuad = (pts) => {
+    let use = pts;
+    let coef = null;
+    for (let round = 0; round < 2; round++) {
+      const n = use.length;
+      const mx = use.reduce((a, p) => a + p.x, 0) / n;
+      let s0 = n, s1 = 0, s2 = 0, s3 = 0, s4 = 0, t0 = 0, t1 = 0, t2 = 0;
+      for (const p of use) {
+        const x = (p.x - mx) / 1000, x2 = x * x;
+        s1 += x; s2 += x2; s3 += x2 * x; s4 += x2 * x2;
+        t0 += p.y; t1 += x * p.y; t2 += x2 * p.y;
+      }
+      // 3×3 정규방정식 크래머 풀이
+      const det = s0 * (s2 * s4 - s3 * s3) - s1 * (s1 * s4 - s3 * s2) + s2 * (s1 * s3 - s2 * s2);
+      if (Math.abs(det) < 1e-12) { const m = t0 / n; coef = { mx, a: m, b: 0, c: 0 }; break; }
+      const a = (t0 * (s2 * s4 - s3 * s3) - s1 * (t1 * s4 - s3 * t2) + s2 * (t1 * s3 - s2 * t2)) / det;
+      const b = (s0 * (t1 * s4 - s3 * t2) - t0 * (s1 * s4 - s3 * s2) + s2 * (s1 * t2 - t1 * s2)) / det;
+      const c = (s0 * (s2 * t2 - t1 * s3) - s1 * (s1 * t2 - t1 * s2) + t0 * (s1 * s3 - s2 * s2)) / det;
+      coef = { mx, a, b, c };
+      if (round === 1) break;
+      const res = use.map((p) => { const x = (p.x - mx) / 1000; return Math.abs(p.y - (a + b * x + c * x * x)); });
+      const med = [...res].sort((p, q) => p - q)[res.length >> 1] || 0;
+      const kept = use.filter((_, i) => res[i] <= Math.max(1.5, 2.5 * med));
+      if (kept.length >= Math.max(6, use.length * 0.6)) use = kept; else break;
+    }
+    return (x) => { const t = (x - coef.mx) / 1000; return coef.a + coef.b * t + coef.c * t * t; };
+  };
   const L = [];
   for (const pts of text.lines) {
-    const ys = pts.map((p) => p.y);
-    const m = ys.reduce((a, b) => a + b, 0) / ys.length;
-    const dev = pts.map((p, i) => {
-      let s = 0, c = 0;
-      for (let k = -2; k <= 2; k++) { const j = i + k; if (j >= 0 && j < pts.length) { s += pts[j].y - m; c++; } }
-      return s / c;
-    });
-    L.push({ m, xs: pts.map((p) => p.x), dev });
+    const f = fitQuad(pts);
+    const xs = pts.map((p) => p.x);
+    const fitted = xs.map(f);
+    const m = fitted.reduce((a, b) => a + b, 0) / fitted.length;
+    L.push({ m, xs, dev: fitted.map((y) => y - m) });
   }
   L.sort((a, b) => a.m - b.m);
   const devAt = (ln, x) => { // 줄 안 가로 선형 보간, 밖은 끝값 유지
