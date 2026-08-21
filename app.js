@@ -1310,6 +1310,7 @@ function camConstraints() {
   if (state.camFlip === undefined) state.camFlip = localStorage.getItem('ds_camFlip') === '1';
   let portrait = window.innerHeight >= window.innerWidth;
   if (state.camFlip) portrait = !portrait; // 사용자가 회전 버튼으로 방향을 뒤집은 경우
+  if (state.spreadMode) portrait = false;   // 책펼침: 화면 방향과 무관하게 항상 가로 프레임
   return {
     facingMode: { ideal: 'environment' },
     width: { ideal: portrait ? 3000 : 4000 },
@@ -1336,9 +1337,9 @@ async function startCamera(isRetry = false) {
       await new Promise((r) => setTimeout(r, 250)); // 설정 안정화 대기
       const orientMismatch = () => {
         const st = track.getSettings();
-        const screenLandscape = window.innerWidth > window.innerHeight;
+        const wantLandscape = state.spreadMode ? true : window.innerWidth > window.innerHeight; // 책펼침은 항상 가로
         const vidLandscape = (st.width || 0) > (st.height || 0);
-        return vidLandscape !== screenLandscape; // 화면은 세로인데 프레임이 가로(또는 그 반대)
+        return vidLandscape !== wantLandscape;
       };
       const bad = () => {
         const st = track.getSettings();
@@ -1366,7 +1367,7 @@ async function startCamera(isRetry = false) {
       }
       if (state.camAutoFlipPending) {
         state.camAutoFlipPending = false;
-        if (!orientMismatch()) {
+        if (!orientMismatch() && !state.spreadMode) { // 책펼침 중 뒤집은 결과는 기억하지 않음(단일 모드 설정 보호)
           try { localStorage.setItem('ds_camFlip', state.camFlip ? '1' : '0'); } catch (e) { /* 저장 불가 환경 */ }
         }
       }
@@ -2761,9 +2762,12 @@ function bindEvents() {
   // 펼침면에서는 ㄴ 기준선 대신 ㅗ(책등 세로선+바닥 가로선, 오버레이에 그림)만 표시
   const syncGuide = () => document.querySelector('.frame-guide').classList.toggle('hidden', !!state.spreadMode);
   syncGuide();
-  $('btn-spread').onclick = () => {
+  $('btn-spread').onclick = async () => {
     state.spreadMode = !state.spreadMode;
     syncGuide();
+    // 책펼침 ↔ 단일: 카메라 프레임 방향을 바꿔 재시작 (책펼침=가로, 단일=화면 방향)
+    state.camAutoFlipTried = false;
+    if (state.stream) { stopCamera(); await new Promise((r) => setTimeout(r, 200)); await startCamera(); }
     localStorage.setItem('spreadMode', state.spreadMode ? '1' : '0');
     $('btn-spread').classList.toggle('on', state.spreadMode);
     toast(state.spreadMode
@@ -2875,7 +2879,7 @@ function bindEvents() {
     rotTimer = setTimeout(() => {
       if (state.screen !== 'capture' || !state.stream) return;
       const st = state.stream.getVideoTracks()[0]?.getSettings() || {};
-      const winLandscape = window.innerWidth > window.innerHeight;
+      const winLandscape = state.spreadMode ? true : window.innerWidth > window.innerHeight;
       const vidLandscape = (st.width || 0) > (st.height || 0);
       if (vidLandscape !== winLandscape) {
         stopCamera();
