@@ -1575,7 +1575,15 @@ function startLiveOverlay() {
 
       // 펼침면 모드: 좌/우 페이지를 각각 표시 + 가운데 책등 경계를 빨간 선으로
       if (state.spreadMode) {
+        measureFrameQuality(work);
         const sq = detectSpreadQuads(work);
+        // 정지 판정(책펼침): 융합 사각형이 프레임 간 0.8% 이내 + 움직임 작음
+        const sPoly = [sq.left.tl, sq.left.bl, sq.right.tr, sq.right.br];
+        const frameMax = Math.max(work.width, work.height);
+        if (liveDetect.lastSpreadPoly && polyMaxDist(sPoly, liveDetect.lastSpreadPoly) < 0.008 * frameMax && liveDetect.motion < 4) liveDetect.stillStreak++;
+        else liveDetect.stillStreak = 0;
+        liveDetect.lastSpreadPoly = sPoly.map((p) => ({ x: p.x, y: p.y }));
+        liveDetect.hitStreak = sq.fromDetection >= 1 ? liveDetect.hitStreak + 1 : 0;
         const cw = overlay.clientWidth, ch = overlay.clientHeight;
         overlay.width = cw; overlay.height = ch;
         const octx = overlay.getContext('2d');
@@ -1610,14 +1618,31 @@ function startLiveOverlay() {
         octx.setLineDash([12, 8]);
         octx.stroke();
         octx.setLineDash([]);
+        const blurryS = liveDetect.sharp < Math.max(15, 0.55 * liveDetect.sharpMax);
+        const movingS = liveDetect.motion >= 4;
+        const readyS = two && liveDetect.hitStreak >= 4 && liveDetect.stillStreak >= 2 && !blurryS && !movingS;
+        liveDetect.readyStreak = readyS ? liveDetect.readyStreak + 1 : 0;
         if (hint) {
-          if (two) {
-            hint.textContent = '펼침면 인식됨 — 촬영하면 2페이지로 분할';
+          if (two && (movingS || blurryS)) {
+            hint.textContent = movingS ? '흔들림 — 잠시 멈춰 주세요' : '초점이 흐림 — 거리를 조정해 주세요';
+            hint.className = 'detect-hint warn';
+          } else if (readyS && state.autoCapture) {
+            hint.textContent = liveDetect.sceneChanged ? '자동 촬영 준비…' : '다음 장으로 넘겨 주세요';
+            hint.className = 'detect-hint ok';
+          } else if (two) {
+            hint.textContent = '책펼침 인식됨 — 촬영하면 2페이지로 분할';
             hint.className = 'detect-hint ok';
           } else {
             hint.textContent = '책등은 세로 빨간 선, 아래쪽은 가로 빨간 선에 맞추세요';
             hint.className = 'detect-hint';
           }
+        }
+        if (state.autoCapture && readyS && liveDetect.readyStreak >= 3 && liveDetect.sceneChanged
+            && !state.capturing && Date.now() - liveDetect.lastAutoAt > 2500) {
+          liveDetect.lastAutoAt = Date.now();
+          liveDetect.sceneChanged = false;
+          liveDetect.readyStreak = 0;
+          capture();
         }
         return;
       }
@@ -1705,7 +1730,7 @@ function startLiveOverlay() {
       if (liveDetect.poly && liveDetect.lastPolyForStill && polyMaxDist(liveDetect.poly, liveDetect.lastPolyForStill) < 0.008 * frameMax && liveDetect.motion < 4) liveDetect.stillStreak++;
       else liveDetect.stillStreak = 0;
       liveDetect.lastPolyForStill = liveDetect.poly ? liveDetect.poly.map((p) => ({ x: p.x, y: p.y })) : null;
-      const blurry = liveDetect.sharp < Math.max(40, 0.55 * liveDetect.sharpMax);
+      const blurry = liveDetect.sharp < Math.max(15, 0.55 * liveDetect.sharpMax); // 하한 15: 여백 많은 페이지도 통과, 상대 기준이 주
       const moving = liveDetect.motion >= 4;
       const ready = stable && liveDetect.hitStreak >= 4 && liveDetect.stillStreak >= 2 && !blurry && !moving;
       liveDetect.readyStreak = ready ? liveDetect.readyStreak + 1 : 0;
