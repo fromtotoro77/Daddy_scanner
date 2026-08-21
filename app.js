@@ -952,6 +952,75 @@ function warpModel(src, model, opts) {
 }
 
 /* ============================================================
+   손가락 제거 — 종이색 채우기 (PatchMatch류 내용 합성은 가려진 글자를 '지어내므로' 스캐너엔 부적합)
+   검출: YCrCb 피부색 ∧ 페이지 테두리 접촉 ∧ 면적 0.08~20% ∧ 종이보다 확연히 어두움(누런 종이 오검출 방지)
+   채움: 1/4 축소본에서 Telea 인페인팅으로 주변 종이색을 끌어와 원크기로 올린 뒤, 경계를 부드럽게 합성
+   ============================================================ */
+function removeFingers(canvas) {
+  const W = canvas.width, H = canvas.height;
+  if (W < 64 || H < 64) return false;
+  const src = cv.imread(canvas);
+  const rgb = new cv.Mat(); cv.cvtColor(src, rgb, cv.COLOR_RGBA2RGB);
+  const ycc = new cv.Mat(); cv.cvtColor(rgb, ycc, cv.COLOR_RGB2YCrCb);
+  const lo = new cv.Mat(H, W, cv.CV_8UC3, new cv.Scalar(0, 133, 77));
+  const hi = new cv.Mat(H, W, cv.CV_8UC3, new cv.Scalar(255, 180, 135));
+  const mask = new cv.Mat(); cv.inRange(ycc, lo, hi, mask);
+  lo.delete(); hi.delete(); ycc.delete();
+  const k5 = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5, 5));
+  const k9 = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(9, 9));
+  cv.morphologyEx(mask, mask, cv.MORPH_OPEN, k5);
+  cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, k9);
+  // 종이 밝기: 그레이 70퍼센타일(글자 제외)
+  const gray = new cv.Mat(); cv.cvtColor(rgb, gray, cv.COLOR_RGB2GRAY);
+  const gd = gray.data; const samp = [];
+  for (let i = 0; i < gd.length; i += 97) samp.push(gd[i]);
+  samp.sort((a, b) => a - b);
+  const paper = samp[Math.floor(samp.length * 0.7)];
+  const labels = new cv.Mat(), stats = new cv.Mat(), cents = new cv.Mat();
+  const n = cv.connectedComponentsWithStats(mask, labels, stats, cents, 8, cv.CV_32S);
+  const keep = new cv.Mat.zeros(H, W, cv.CV_8U);
+  const lab = labels.data32S; const md = mask.data;
+  let kept = 0;
+  for (let i = 1; i < n; i++) {
+    const x = stats.intAt(i, cv.CC_STAT_LEFT), y = stats.intAt(i, cv.CC_STAT_TOP);
+    const w = stats.intAt(i, cv.CC_STAT_WIDTH), h = stats.intAt(i, cv.CC_STAT_HEIGHT);
+    const area = stats.intAt(i, cv.CC_STAT_AREA);
+    const touches = x <= 1 || y <= 1 || x + w >= W - 1 || y + h >= H - 1;
+    if (!touches || area < W * H * 0.0008 || area > W * H * 0.2) continue;
+    // 성분 평균 밝기
+    let sum = 0, c = 0;
+    for (let yy = y; yy < y + h; yy += 2) for (let xx = x; xx < x + w; xx += 2) { const j = yy * W + xx; if (lab[j] === i) { sum += gd[j]; c++; } }
+    if (!c || sum / c > paper - 15) continue;
+    for (let yy = y; yy < y + h; yy++) for (let xx = x; xx < x + w; xx++) { const j = yy * W + xx; if (lab[j] === i) keep.data[j] = 255; }
+    kept++;
+  }
+  labels.delete(); stats.delete(); cents.delete(); mask.delete(); gray.delete();
+  if (!kept) { src.delete(); rgb.delete(); keep.delete(); k5.delete(); k9.delete(); return false; }
+  // 경계 여유: 손가락 가장자리 그림자까지 포함
+  const kd = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(Math.max(7, Math.round(W * 0.012)) | 1, Math.max(7, Math.round(W * 0.012)) | 1));
+  cv.dilate(keep, keep, kd);
+  // 1/4 축소에서 인페인팅
+  const ds = 0.25, sw = Math.max(16, Math.round(W * ds)), sh = Math.max(16, Math.round(H * ds));
+  const smallRgb = new cv.Mat(); cv.resize(rgb, smallRgb, new cv.Size(sw, sh), 0, 0, cv.INTER_AREA);
+  const smallMask = new cv.Mat(); cv.resize(keep, smallMask, new cv.Size(sw, sh), 0, 0, cv.INTER_NEAREST);
+  cv.dilate(smallMask, smallMask, k5);
+  const filledS = new cv.Mat(); cv.inpaint(smallRgb, filledS, smallMask, 5, cv.INPAINT_TELEA);
+  const filled = new cv.Mat(); cv.resize(filledS, filled, new cv.Size(W, H), 0, 0, cv.INTER_LINEAR);
+  // 부드러운 합성
+  const alpha = new cv.Mat(); cv.GaussianBlur(keep, alpha, new cv.Size(0, 0), Math.max(2, W * 0.004));
+  const sd = src.data, fd = filled.data, ad = alpha.data;
+  for (let i = 0, j = 0, q = 0; i < W * H; i++, j += 4, q += 3) {
+    const a = ad[i] / 255; if (a <= 0) continue;
+    sd[j] = sd[j] * (1 - a) + fd[q] * a;
+    sd[j + 1] = sd[j + 1] * (1 - a) + fd[q + 1] * a;
+    sd[j + 2] = sd[j + 2] * (1 - a) + fd[q + 2] * a;
+  }
+  cv.imshow(canvas, src);
+  src.delete(); rgb.delete(); keep.delete(); k5.delete(); k9.delete(); kd.delete(); smallRgb.delete(); smallMask.delete(); filledS.delete(); filled.delete(); alpha.delete();
+  return true;
+}
+
+/* ============================================================
    이미지 처리 파이프라인: 원본 → 원근보정 → 회전 → 필터 → 밝기/대비
    ============================================================ */
 let procChain = Promise.resolve();
@@ -990,6 +1059,11 @@ async function processPage(page, maxSide) {
         console.warn('warp 실패', e);
         try { src = warpPerspective(src, sc); } catch (e2) { /* 원본 유지 */ }
       }
+    }
+
+    // 1.5) 손가락 제거 (종이색 채우기) — 페이지 테두리에 걸친 피부색 영역만
+    if (state.cvReady && page.fingerFix !== false) {
+      try { removeFingers(src); } catch (e) { console.warn('손가락 제거 실패', e); }
     }
 
     // 2) 최종 크기 맞춤
@@ -2327,9 +2401,12 @@ async function renderEdit() {
   $('sl-contrast').value = page.contrast;
   $('sl-bright-v').textContent = page.bright;
   $('sl-contrast-v').textContent = page.contrast;
-  $('opt-chips').classList.toggle('hidden', !page.model);
+  $('opt-chips').classList.remove('hidden');
+  $('opt-textrect').classList.toggle('hidden', !page.model);
+  $('opt-margin').classList.toggle('hidden', !page.model);
   $('opt-textrect').classList.toggle('active', page.textRect !== false);
   $('opt-margin').classList.toggle('active', page.marginFix !== false);
+  $('opt-finger').classList.toggle('active', page.fingerFix !== false);
   await redrawEdit();
 }
 
@@ -2728,6 +2805,7 @@ function bindEvents() {
   };
   $('opt-textrect').onclick = () => toggleOpt('textRect', $('opt-textrect'));
   $('opt-margin').onclick = () => toggleOpt('marginFix', $('opt-margin'));
+  $('opt-finger').onclick = () => toggleOpt('fingerFix', $('opt-finger'));
   $('btn-corner-full').onclick = () => applyCorners(true);
   $('btn-corner-auto').onclick = cornerAutoDetect;
   window.addEventListener('resize', () => {
