@@ -752,12 +752,19 @@ async function detectCorners(page) {
     c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
     bmp.close();
 
-    const found = findDocQuad(c, 0.15, !page.spreadSide); // 반쪽은 책등 쪽이 경계에 닿으므로 경계 페널티 없음
-    let corners = found ? found.quad : null;
-    let curves = found ? (found.curves || extractCurves(found.contour, found.quad)) : null;
+    let found = null, corners = null, curves = null;
+    if (page.presetCorners) {
+      // 펼침면 대칭 융합 결과(원본 좌표) → 감지 캔버스 좌표
+      const dn = (pt) => ({ x: Math.min(c.width, Math.max(0, pt.x * scale)), y: Math.min(c.height, Math.max(0, pt.y * scale)) });
+      corners = { tl: dn(page.presetCorners.tl), tr: dn(page.presetCorners.tr), br: dn(page.presetCorners.br), bl: dn(page.presetCorners.bl) };
+    } else {
+      found = findDocQuad(c, 0.15, !page.spreadSide); // 반쪽은 책등 쪽이 경계에 닿으므로 경계 페널티 없음
+      corners = found ? found.quad : null;
+      curves = found ? (found.curves || extractCurves(found.contour, found.quad)) : null;
+    }
 
     // 최후 폴백: jscanify 기본 감지 (곡선 없음)
-    if (!corners) {
+    if (!corners && !page.presetCorners) {
       const img = cv.imread(c);
       const contour = state.scanner.findPaperContour(img);
       if (contour) {
@@ -841,7 +848,7 @@ function quadArea(c) {
 const yieldUI = () => new Promise((r) => setTimeout(r, 0));
 
 /* 피팅은 수 초 걸리므로 시드 사이마다 이벤트 루프에 양보 (카메라 프리뷰가 멈추지 않게) */
-async function fitPageModelAsync(canvas, anchors) {
+async function fitPageModelAsync(canvas, anchors, slackFrac) {
   const W = canvas.width, H = canvas.height;
   const field = pmBuildField(canvas);
   try {
@@ -849,7 +856,7 @@ async function fitPageModelAsync(canvas, anchors) {
     const ys = [anchors.tl.y, anchors.tr.y, anchors.br.y, anchors.bl.y];
     const bbox = { x0: Math.min(...xs), x1: Math.max(...xs), y0: Math.min(...ys), y1: Math.max(...ys) };
     const P0 = pmAlignToQuad(anchors, W, H, pmInit(bbox, W, H)).P;
-    const guide = { ...bbox, anchorC: anchors, slack: 0.01 * Math.max(W, H), w: 20 };
+    const guide = { ...bbox, anchorC: anchors, slack: (slackFrac || 0.01) * Math.max(W, H), w: 20 };
     let best = null;
     for (const s of PM_SEEDS) {
       const r = pmFit(field, W, H, guide, { ...P0, ...s });
@@ -895,7 +902,7 @@ async function fitModelForPage(page, canvas, scale) {
   const dn = (p) => ({ x: p.x * scale, y: p.y * scale });
   const anchors = { tl: dn(page.corners.tl), tr: dn(page.corners.tr), br: dn(page.corners.br), bl: dn(page.corners.bl) };
   try {
-    const model = await fitPageModelAsync(canvas, anchors);
+    const model = await fitPageModelAsync(canvas, anchors, page.spreadSide ? 0.02 : 0.01); // 융합 앵커는 근사치라 여유 2%
     if (seq !== page._modelSeq) return;
     page.model = model;
   } catch (e) {
@@ -1567,7 +1574,7 @@ function startLiveOverlay() {
 
       // 펼침면 모드: 좌/우 페이지를 각각 표시 + 가운데 책등 경계를 빨간 선으로
       if (state.spreadMode) {
-        const blobs = findPageBlobs(work);
+        const sq = detectSpreadQuads(work);
         const cw = overlay.clientWidth, ch = overlay.clientHeight;
         overlay.width = cw; overlay.height = ch;
         const octx = overlay.getContext('2d');
@@ -1575,9 +1582,9 @@ function startLiveOverlay() {
         const fit = Math.min(cw / vw, ch / vh);
         const ox = (cw - vw * fit) / 2, oy = (ch - vh * fit) / 2;
         const map = (p) => [(p.x / s) * fit + ox, (p.y / s) * fit + oy];
-        const two = blobs.length === 2;
+        const two = sq.fromDetection >= 1;
         const color = two ? 'rgba(74, 222, 128, 0.95)' : 'rgba(74, 222, 128, 0.45)';
-        for (const b of blobs) {
+        for (const b of [{ quad: sq.left }, { quad: sq.right }]) {
           const pts = ['tl', 'tr', 'br', 'bl'].map((k) => map(b.quad[k]));
           octx.beginPath();
           octx.moveTo(pts[0][0], pts[0][1]);
@@ -1849,6 +1856,47 @@ function healHorizontalBands(bin) {
 /* 펼침면 페이지 감지 — 중앙 고정선 방식:
    책등 = 화면 가운데(사용자가 빨간 선에 맞춤)로 고정하고,
    좌/우 절반에서 각각 "페이지 하나"만 찾는다 (책등 그림자 유무와 무관하게 동작) */
+/* 펼침면 대칭 융합 감지(사용자 원칙: 펼친 책은 책등을 축으로 어느 정도 대칭):
+   좌/우 절반에서 각각 페이지를 감지한 뒤 거울 대칭으로 융합한다 —
+   책등 위·아래 점은 두 페이지 공유(평균), 페이지 폭·위아래 높이는 좌우 평균.
+   한쪽 감지가 실패하면 다른 쪽을 거울로 씀, 둘 다 실패하면 가이드 인셋.
+   반환: { left, right }(캔버스 좌표 사각형), fromDetection(좌/우 감지 성공 수) */
+function detectSpreadQuads(canvas) {
+  const W = canvas.width, H = canvas.height, mid = W / 2;
+  const half = (x0, w) => {
+    const c = document.createElement('canvas');
+    c.width = w; c.height = H;
+    c.getContext('2d').drawImage(canvas, x0, 0, w, H, 0, 0, w, H);
+    return c;
+  };
+  let L = null, R = null;
+  try {
+    const fl = findDocQuad(half(0, Math.round(mid)), 0.15, false);
+    if (fl && quadArea(fl.quad) >= mid * H * 0.2) L = fl.quad;
+    const fr = findDocQuad(half(Math.round(mid), W - Math.round(mid)), 0.15, false);
+    if (fr && quadArea(fr.quad) >= (W - mid) * H * 0.2) {
+      const o = Math.round(mid);
+      R = { tl: { x: fr.quad.tl.x + o, y: fr.quad.tl.y }, tr: { x: fr.quad.tr.x + o, y: fr.quad.tr.y }, br: { x: fr.quad.br.x + o, y: fr.quad.br.y }, bl: { x: fr.quad.bl.x + o, y: fr.quad.bl.y } };
+    }
+  } catch (e) { /* 감지 실패 → 기본값 */ }
+  const gy0 = H * GUIDE_INSET, gy1 = H * (1 - GUIDE_INSET), gx0 = W * GUIDE_INSET;
+  // 좌/우에서 관측된 값(없으면 null)
+  const obs = {
+    spineTop: [L ? L.tr.y : null, R ? R.tl.y : null],
+    spineBot: [L ? L.br.y : null, R ? R.bl.y : null],
+    width: [L ? mid - L.tl.x : null, R ? R.tr.x - mid : null],
+    outerTop: [L ? L.tl.y : null, R ? R.tr.y : null],
+    outerBot: [L ? L.bl.y : null, R ? R.br.y : null],
+  };
+  const fuse = (pair, def) => { const v = pair.filter((x) => x !== null); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : def; };
+  const spineTop = fuse(obs.spineTop, gy0), spineBot = fuse(obs.spineBot, gy1);
+  const width = Math.max(W * 0.15, Math.min(mid - 2, fuse(obs.width, mid - gx0)));
+  const outerTop = fuse(obs.outerTop, gy0), outerBot = fuse(obs.outerBot, gy1);
+  const left = { tl: { x: mid - width, y: outerTop }, tr: { x: mid, y: spineTop }, br: { x: mid, y: spineBot }, bl: { x: mid - width, y: outerBot } };
+  const right = { tl: { x: mid, y: spineTop }, tr: { x: mid + width, y: outerTop }, br: { x: mid + width, y: outerBot }, bl: { x: mid, y: spineBot } };
+  return { left, right, fromDetection: (L ? 1 : 0) + (R ? 1 : 0) };
+}
+
 function findPageBlobs(canvas) {
   const W = canvas.width, H = canvas.height;
   const mid = W >> 1;
@@ -1900,11 +1948,25 @@ async function addSpreadPages(blob, silent) {
       return new Promise((res) => c.toBlob(res, 'image/jpeg', 0.92));
     };
     const mid = Math.round(bmp.width / 2);
+    // 대칭 융합 감지 (≤1000px 캔버스) → 원본 좌표 → 반쪽 좌표
+    let presetL = null, presetR = null;
+    if (state.cvReady) {
+      const scale = Math.min(1, 1000 / Math.max(bmp.width, bmp.height));
+      const dc = document.createElement('canvas');
+      dc.width = Math.round(bmp.width * scale); dc.height = Math.round(bmp.height * scale);
+      dc.getContext('2d').drawImage(bmp, 0, 0, dc.width, dc.height);
+      const sq = detectSpreadQuads(dc);
+      const up = (pt, dx) => ({ x: Math.max(0, pt.x / scale - dx), y: pt.y / scale });
+      presetL = { tl: up(sq.left.tl, 0), tr: up(sq.left.tr, 0), br: up(sq.left.br, 0), bl: up(sq.left.bl, 0) };
+      presetL.tr.x = mid; presetL.br.x = mid;
+      presetR = { tl: up(sq.right.tl, mid), tr: up(sq.right.tr, mid), br: up(sq.right.br, mid), bl: up(sq.right.bl, mid) };
+      presetR.tl.x = 0; presetR.bl.x = 0;
+    }
     const lb = await half(0, mid);
     const rb = await half(mid, bmp.width - mid);
     bmp.close();
-    await addPage(lb, true, false, true, 'left');
-    await addPage(rb, true, false, true, 'right');
+    await addPage(lb, true, false, true, 'left', presetL);
+    await addPage(rb, true, false, true, 'right', presetR);
     if (!silent) toast(`펼침면 분할 → ${state.pages.length - 1}·${state.pages.length}페이지`, { type: 'success', duration: 1600 });
     return true;
   } catch (e) {
@@ -1994,9 +2056,10 @@ function findSpineX(canvas) {
 }
 
 /* 페이지 추가 (촬영/불러오기 공용). preprocessed=true면 이미 보정된 이미지라 감지 생략 */
-async function addPage(blob, silent = false, preprocessed = false, fromCamera = false, spreadSide = null) {
+async function addPage(blob, silent = false, preprocessed = false, fromCamera = false, spreadSide = null, presetCorners = null) {
   const page = {
     spreadSide, // 'left' | 'right' — 펼침면 반쪽: 책등 쪽 변은 캔버스 경계에 고정
+    presetCorners, // 펼침면 대칭 융합으로 이미 정해진 모서리(원본 좌표) — 감지 대신 사용
     id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random(),
     blob,
     corners: null,
